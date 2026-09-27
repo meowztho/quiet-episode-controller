@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "project": "Quiet Episode Controller",
+  "canonical": {
+    "vision": "authority/VISION.md",
+    "interview_ledger": "authority/INTERVIEW_LEDGER.md",
+    "decisions": "authority/DECISIONS.md",
+    "product_realization": "authority/PRODUCT_REALIZATION.yaml",
+    "architecture": "authority/ARCHITECTURE.md",
+    "capability_contracts": "authority/CAPABILITY_CONTRACTS.md",
+    "project_plan": "authority/PROJECT_PLAN.yaml",
+    "acceptance_evidence": "authority/ACCEPTANCE_EVIDENCE.yaml",
+    "state": "authority/STATE.yaml",
+    "research": "authority/RESEARCH.md",
+    "test_strategy": "authority/TEST_STRATEGY.md"
+  },
+  "generated": {
+    "atlas": "PROJECT_ATLAS.html"
+  },
+  "prompts": {
+    "goal": "prompts/GOAL.md",
+    "start": "prompts/START.md",
+    "continue": "prompts/CONTINUE.md"
+  }
+}

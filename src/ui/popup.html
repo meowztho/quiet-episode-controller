@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Quiet Episode Controller</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <main>
+    <h1>Quiet Episode Controller</h1>
+    <div id="state" class="state">Lade…</div>
+    <div id="details" class="details"></div>
+
+    <label class="row">
+      <span>Hoster</span>
+      <select id="provider">
+        <option value="auto">Auto: VOE → Doodstream</option>
+        <option value="voe">VOE</option>
+        <option value="doodstream">Doodstream</option>
+      </select>
+    </label>
+
+    <label class="check">
+      <input id="fullscreen" type="checkbox" checked>
+      <span>Edge/Chrome-Fenster für Wiedergabe in Vollbild</span>
+    </label>
+
+    <div class="actions">
+      <button id="start" type="button">Start</button>
+      <button id="grant" type="button" hidden>Zugriff erlauben</button>
+      <button id="stop" type="button" class="secondary">Stop</button>
+    </div>
+    <div id="error" class="error" role="status"></div>
+  </main>
+  <script type="module" src="popup.js"></script>
+</body>
+</html>

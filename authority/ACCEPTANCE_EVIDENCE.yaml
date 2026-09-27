@@ -1,0 +1,593 @@
+{
+  "schema": 1,
+  "criteria": [
+    {
+      "id": "A-M0-001",
+      "stage": "M0",
+      "criterion": "Extension skeleton loads in Chrome as MV3 without manifest errors",
+      "required_evidence_class": "browser",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "browser",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "python tests/browser/run_browser_tests.py",
+          "result": "INCONCLUSIVE",
+          "notes": "Managed Chromium did not load the unpacked extension; production extension runtime was not exercised. The environment has ExtensionInstallBlocklist=[\"*\"]."
+        },
+        {
+          "class": "browser",
+          "revision": "951382b",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (Chromium), user-loaded unpacked extension",
+          "result": "VERIFIED",
+          "notes": "User live test loaded the unpacked extension successfully. The popup rendered live session state, Start reached the service worker, AniWorld episode S1E1 was probed, VOE was selected, and the provider permission state was returned to the popup. This proves MV3 load plus popup/service-worker versioned messaging. The subsequent provider-frame receiver failure is outside M0 and remains M3 evidence."
+        }
+      ]
+    },
+    {
+      "id": "A-M0-002",
+      "stage": "M0",
+      "criterion": "Start/Stop surface and service worker can exchange a versioned message",
+      "required_evidence_class": "browser",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "browser",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "python tests/browser/run_browser_tests.py",
+          "result": "INCONCLUSIVE",
+          "notes": "Managed Chromium did not load the unpacked extension; production extension runtime was not exercised. The environment has ExtensionInstallBlocklist=[\"*\"]."
+        },
+        {
+          "class": "browser",
+          "revision": "951382b",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (Chromium), user-loaded unpacked extension",
+          "result": "VERIFIED",
+          "notes": "User live test loaded the unpacked extension successfully. The popup rendered live session state, Start reached the service worker, AniWorld episode S1E1 was probed, VOE was selected, and the provider permission state was returned to the popup. This proves MV3 load plus popup/service-worker versioned messaging. The subsequent provider-frame receiver failure is outside M0 and remains M3 evidence."
+        }
+      ]
+    },
+    {
+      "id": "A-001",
+      "stage": "M1",
+      "criterion": "Start creates exactly one canonical session and repeated Start is idempotent or explicitly restarts by contract",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "npm test",
+          "result": "15/15 PASS",
+          "notes": "Includes idempotent repeated Start, tab-close/Stop lifecycle termination, duplicate MEDIA_ENDED deduplication, and stale session/epoch/tab rejection."
+        }
+      ]
+    },
+    {
+      "id": "A-002",
+      "stage": "M1",
+      "criterion": "Stop terminates progression and stale events cannot restart it",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "npm test",
+          "result": "15/15 PASS",
+          "notes": "Includes idempotent repeated Start, tab-close/Stop lifecycle termination, duplicate MEDIA_ENDED deduplication, and stale session/epoch/tab rejection."
+        }
+      ]
+    },
+    {
+      "id": "A-003",
+      "stage": "M2",
+      "criterion": "Supported episode page on AniWorld or any admitted SerienStream mirror is recognized through the shared adapter contract",
+      "required_evidence_class": "fixture",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "fixture",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "python tests/browser/run_dom_fixture_tests.py (+ npm test for final/no-next state)",
+          "result": "PASS",
+          "notes": "Representative structural AniWorld fixture verifies supported/unsupported probing, provider extraction, next-episode resolution, site-native provider activation with player visibility, and the bounded direct-iframe fallback; no-next completion is covered by the deterministic session suite."
+        },
+        {
+          "class": "fixture",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "python tests/browser/run_dom_fixture_tests.py",
+          "result": "PASS",
+          "notes": "v0.2 AniWorld fixture verifies episode identity, next-episode resolution, loop rejection, and canonical provider-navigation candidates for VOE/FileMoon/Doodstream."
+        },
+        {
+          "class": "test",
+          "revision": "15f771d",
+          "date": "2026-09-27",
+          "command": "npm test + python tests/browser/run_dom_fixture_tests.py",
+          "result": "VERIFIED",
+          "notes": "Shared adapter tests and DOM fixtures cover AniWorld, serienstream.to, and http://186.2.175.5/ with canonical episode identity/provider candidates."
+        },
+        {
+          "class": "test",
+          "revision": "73fe418",
+          "date": "2026-09-27",
+          "command": "npm test + python tests/browser/run_dom_fixture_tests.py",
+          "result": "VERIFIED",
+          "notes": "Shared adapter tests and DOM fixtures cover AniWorld plus serienstream.to, s.to, serienstream.cx, and http://186.2.175.5/. SerienStream-family fixtures use the current #episode-links .link-box[data-play-url] layout and normalize VOE/Doodstream into canonical provider-navigation candidates."
+        }
+      ]
+    },
+    {
+      "id": "A-004",
+      "stage": "M2",
+      "criterion": "Unsupported/non-episode pages fail closed without navigation",
+      "required_evidence_class": "fixture",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "fixture",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "python tests/browser/run_dom_fixture_tests.py (+ npm test for final/no-next state)",
+          "result": "PASS",
+          "notes": "Representative structural AniWorld fixture verifies supported/unsupported probing, provider extraction, next-episode resolution, site-native provider activation with player visibility, and the bounded direct-iframe fallback; no-next completion is covered by the deterministic session suite."
+        },
+        {
+          "class": "fixture",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "python tests/browser/run_dom_fixture_tests.py",
+          "result": "PASS",
+          "notes": "v0.2 AniWorld fixture verifies episode identity, next-episode resolution, loop rejection, and canonical provider-navigation candidates for VOE/FileMoon/Doodstream."
+        }
+      ]
+    },
+    {
+      "id": "A-005",
+      "stage": "M2",
+      "criterion": "Next episode is resolved to the intended canonical target",
+      "required_evidence_class": "fixture",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "fixture",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "python tests/browser/run_dom_fixture_tests.py (+ npm test for final/no-next state)",
+          "result": "PASS",
+          "notes": "Representative structural AniWorld fixture verifies supported/unsupported probing, provider extraction, next-episode resolution, site-native provider activation with player visibility, and the bounded direct-iframe fallback; no-next completion is covered by the deterministic session suite."
+        },
+        {
+          "class": "fixture",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "python tests/browser/run_dom_fixture_tests.py",
+          "result": "PASS",
+          "notes": "v0.2 AniWorld fixture verifies episode identity, next-episode resolution, loop rejection, and canonical provider-navigation candidates for VOE/FileMoon/Doodstream."
+        }
+      ]
+    },
+    {
+      "id": "A-006",
+      "stage": "M2",
+      "criterion": "No-next and same-episode loop cases do not navigate",
+      "required_evidence_class": "fixture",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "fixture",
+          "revision": "96fce31",
+          "date": "2026-09-26",
+          "command": "python tests/browser/run_dom_fixture_tests.py (+ npm test for final/no-next state)",
+          "result": "PASS",
+          "notes": "Representative structural AniWorld fixture verifies supported/unsupported probing, provider extraction, next-episode resolution, site-native provider activation with player visibility, and the bounded direct-iframe fallback; no-next completion is covered by the deterministic session suite."
+        },
+        {
+          "class": "fixture",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "python tests/browser/run_dom_fixture_tests.py",
+          "result": "PASS",
+          "notes": "v0.2 AniWorld fixture verifies episode identity, next-episode resolution, loop rejection, and canonical provider-navigation candidates for VOE/FileMoon/Doodstream."
+        }
+      ]
+    },
+    {
+      "id": "A-007",
+      "stage": "M3",
+      "criterion": "A permitted top-level provider playback tab detects the canonical player technology (recognized driver or HTMLMediaElement fallback) and attaches through the Provider Agent boundary",
+      "required_evidence_class": "browser",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "browser",
+          "revision": "3b7ed20",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "VERIFIED",
+          "notes": "User confirmed that v0.2.3 now shows the correct native JW Player rather than the raw-video overlay, proving player-technology detection/attachment through the provider tab path."
+        }
+      ]
+    },
+    {
+      "id": "A-008",
+      "stage": "M3",
+      "criterion": "Provider playback tab reports playing/paused/ended state from frame 0 without AniWorld cross-origin DOM access; recognized or provider-owned player controls remain single-owner, and only bare HTML5 fallback exposes QEC controls",
+      "required_evidence_class": "browser",
+      "status": "UNVERIFIED",
+      "evidence": [
+        {
+          "class": "browser",
+          "revision": "3b7ed20",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "PARTIAL",
+          "notes": "User confirmed native JW controls and most documented keyboard shortcuts work. Space did not toggle playback and FileMoon viewport presentation remained incomplete; no live ended-state rollover was yet observed. v0.3 addresses Space and viewport compatibility but requires retest."
+        },
+        {
+          "class": "browser",
+          "revision": "ec5277c",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "PARTIAL",
+          "notes": "User retested v0.3.0: native JW player and Space handling are present, but automatic playback still did not start. This falsifies Runtime.evaluate(userGesture:true) as sufficient live evidence for hands-free audible JW startup in this profile; v0.3.1 replaces only that recovery transport with targeted CDP Space input."
+        },
+        {
+          "class": "live_browser",
+          "revision": "d2b6a6a",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "PARTIAL",
+          "notes": "Doodstream reached fullscreen with an existing provider control surface, but v0.3.3 also layered QEC HTML5 controls over it. This live failure motivated the single-control-owner correction in v0.3.4; live verification of the correction is pending."
+        }
+      ]
+    },
+    {
+      "id": "A-009",
+      "stage": "M3",
+      "criterion": "Player/media replacement in the provider playback tab is handled with bounded re-probe and no duplicate observers/listeners",
+      "required_evidence_class": "browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-010",
+      "stage": "M3",
+      "criterion": "One MEDIA_ENDED event causes at most one navigation transition",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "npm test",
+          "result": "20/20 PASS",
+          "notes": "v0.2 tests verify controller/playback tab separation, duplicate MEDIA_ENDED suppression, stale session/epoch/playback-tab rejection, top-level provider origin changes, and exactly one fresh playback tab per next episode."
+        }
+      ]
+    },
+    {
+      "id": "A-011",
+      "stage": "M3",
+      "criterion": "Stale/duplicate media events from an old playback tab or document epoch are ignored",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "npm test",
+          "result": "20/20 PASS",
+          "notes": "v0.2 tests verify controller/playback tab separation, duplicate MEDIA_ENDED suppression, stale session/epoch/playback-tab rejection, top-level provider origin changes, and exactly one fresh playback tab per next episode."
+        }
+      ]
+    },
+    {
+      "id": "A-012",
+      "stage": "M4",
+      "criterion": "At explicit activation, the playback Chrome window can enter configured fullscreen mode",
+      "required_evidence_class": "browser",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "browser",
+          "revision": "2407c7f",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "VERIFIED",
+          "notes": "User reported that the Edge/Chrome window entered fullscreen during the live v0.1.2 test. v0.2 retains the same Window Controller implementation and fullscreen API path; provider/player presentation remains separately unverified live."
+        }
+      ]
+    },
+    {
+      "id": "A-013",
+      "stage": "M4",
+      "criterion": "Episode progression closes/recreates playback tabs without exiting and re-entering browser-window fullscreen",
+      "required_evidence_class": "browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-014",
+      "stage": "M6",
+      "criterion": "At least three sequential representative episodes advance automatically after playback end when provider/browser policy allows playback",
+      "required_evidence_class": "live_browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-015",
+      "stage": "M6",
+      "criterion": "Final/no-next episode reaches COMPLETED and performs no further navigation",
+      "required_evidence_class": "live_browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-016",
+      "stage": "M4",
+      "criterion": "Repository/product code contains no OS mouse/keyboard or coordinate automation path",
+      "required_evidence_class": "static",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "static",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "python scripts/static_check.py",
+          "result": "PASS",
+          "notes": "v0.2 rejects OS input/focus automation, webRequest/subframe architecture, generic DOM clicking, playback-tab lifecycle outside Playback Surface, video DOM outside Provider Agent, and fullscreen writes outside Window Controller."
+        },
+        {
+          "class": "static",
+          "revision": "7e7d9d5",
+          "date": "2026-09-27",
+          "command": "python scripts/static_check.py",
+          "result": "PASS",
+          "notes": "v0.3 static gate verifies no OS input/focus/coordinate automation and constrains chrome.debugger to gesture-activation.js using Runtime.evaluate userGesture:true only; CDP Input/Network/DOM/Fetch/Storage use is rejected."
+        },
+        {
+          "class": "static",
+          "revision": "WORKTREE_V0_3_1",
+          "date": "2026-09-27",
+          "command": "python scripts/static_check.py && python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS",
+          "notes": "v0.3.1 still forbids OS input/focus/coordinates and arbitrary CDP input. The only admitted browser-input path is one fixed Space rawKeyDown/keyUp pair to the canonical playback tab. Provider fixture verifies the targeted background document receives it as isTrusted with transient user activation while another page remains foreground."
+        }
+      ]
+    },
+    {
+      "id": "A-017",
+      "stage": "M4",
+      "criterion": "Normal episode transition performs no explicit window focus/raise call",
+      "required_evidence_class": "static",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "static",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "python scripts/static_check.py",
+          "result": "PASS",
+          "notes": "v0.2 rejects OS input/focus automation, webRequest/subframe architecture, generic DOM clicking, playback-tab lifecycle outside Playback Surface, video DOM outside Provider Agent, and fullscreen writes outside Window Controller."
+        },
+        {
+          "class": "static",
+          "revision": "7e7d9d5",
+          "date": "2026-09-27",
+          "command": "python scripts/static_check.py",
+          "result": "PASS",
+          "notes": "v0.3 static gate verifies no OS input/focus/coordinate automation and constrains chrome.debugger to gesture-activation.js using Runtime.evaluate userGesture:true only; CDP Input/Network/DOM/Fetch/Storage use is rejected."
+        },
+        {
+          "class": "static",
+          "revision": "WORKTREE_V0_3_1",
+          "date": "2026-09-27",
+          "command": "python scripts/static_check.py && python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS",
+          "notes": "v0.3.1 still forbids OS input/focus/coordinates and arbitrary CDP input. The only admitted browser-input path is one fixed Space rawKeyDown/keyUp pair to the canonical playback tab. Provider fixture verifies the targeted background document receives it as isTrusted with transient user activation while another page remains foreground."
+        }
+      ]
+    },
+    {
+      "id": "A-018",
+      "stage": "M4",
+      "criterion": "If playback cannot continue safely, session becomes BLOCKED instead of invoking intrusive fallback",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "npm test && python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS",
+          "notes": "Autoplay denial remains an explicit MEDIA_PLAY_BLOCKED/BLOCKED path; no intrusive fallback exists in v0.2."
+        },
+        {
+          "class": "test",
+          "revision": "7e7d9d5",
+          "date": "2026-09-27",
+          "command": "npm test && python tests/browser/run_provider_fixture_tests.py && python scripts/static_check.py",
+          "result": "PASS",
+          "notes": "JW autoplay denial admits at most one trusted playback activation per episode; repeated denial does not create repeated privileged attempts, and normal session failure remains explicit BLOCKED without input/focus automation."
+        },
+        {
+          "class": "test",
+          "revision": "4aec111",
+          "date": "2026-09-27",
+          "command": "npm run check",
+          "result": "PASS",
+          "notes": "Both privileged recovery transports remain one-attempt-per-episode and playback-tab scoped: JW uses only targeted Space; HTML5 uses one userGesture:true evaluation on the Provider Agent-marked canonical media. Static gate forbids arbitrary keys, mouse input, Network/DOM/Fetch/Storage inspection, focus forcing and OS input."
+        }
+      ]
+    },
+    {
+      "id": "A-019",
+      "stage": "M3",
+      "criterion": "Missing provider-origin permission is represented explicitly and does not cause silent failure",
+      "required_evidence_class": "browser",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "browser",
+          "revision": "777e330",
+          "date": "2026-09-27",
+          "result": "VERIFIED",
+          "notes": "User Edge popup showed BLOCKED / PROVIDER_PERMISSION_REQUIRED with exact current Doodstream origin https://playmogo.com. The playback tab had opened, but provider attachment/fullscreen/autostart had not yet occurred, proving missing host access is surfaced explicitly rather than failing silently."
+        }
+      ]
+    },
+    {
+      "id": "A-020",
+      "stage": "M3",
+      "criterion": "Permission request is initiated only from explicit user-driven flow and resumes the same inactive discovery tab/session without a second Start",
+      "required_evidence_class": "review",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "review",
+          "revision": "7951afd",
+          "date": "2026-09-27",
+          "command": "python scripts/static_check.py + review src/ui/popup.js",
+          "result": "VERIFIED",
+          "notes": "chrome.permissions.request remains only in popup.js and is invoked from the explicit Grant button handler."
+        },
+        {
+          "class": "test",
+          "revision": "1657f12",
+          "date": "2026-09-27",
+          "command": "npm test + python scripts/static_check.py",
+          "result": "VERIFIED",
+          "notes": "Provider redirect tab is inactive while permission is unresolved; popup remains the only permissions.request owner; after grant the same playback tab is activated and attached, with no second Start or duplicate playback tab."
+        }
+      ]
+    },
+    {
+      "id": "A-021",
+      "stage": "M5",
+      "criterion": "Autoplay denial is surfaced as a passive blocked reason while preserving the user's other foreground work",
+      "required_evidence_class": "live_browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-022",
+      "stage": "M5",
+      "criterion": "Unknown/changed provider DOM fails closed with actionable diagnostics",
+      "required_evidence_class": "live_browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-M5-001",
+      "stage": "M5",
+      "criterion": "Current live VOE-family integration is exercised successfully or documented as blocked with current evidence",
+      "required_evidence_class": "live_browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-M5-002",
+      "stage": "M5",
+      "criterion": "Current live DoodStream-family integration is exercised successfully or documented as blocked with current evidence",
+      "required_evidence_class": "live_browser",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "live_browser",
+          "revision": "d2b6a6a",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "BLOCKED",
+          "notes": "After the playmogo permission fix, Doodstream reached fullscreen but autoplay failed with PLAY_START_TIMEOUT / MEDIA_PLAY_BLOCKED / paused=true / ready=4 / try=0, and QEC displayed a duplicate control surface over the existing provider player. v0.3.4 implements the targeted correction; live retest pending."
+        },
+        {
+          "class": "live_browser",
+          "revision": "4aec111",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "VERIFIED",
+          "notes": "User confirmed v0.3.4 Doodstream path works: fullscreen, hands-free autoplay, and only the provider-owned control surface on playmogo.com."
+        }
+      ]
+    },
+    {
+      "id": "A-M6-001",
+      "stage": "M6",
+      "criterion": "Multi-episode run shows no duplicate transitions, runaway retries, orphan/duplicate playback tabs, extra windows, or focus-stealing fallback",
+      "required_evidence_class": "live_browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    },
+    {
+      "id": "A-M5-003",
+      "stage": "M5",
+      "criterion": "FileMoon live integration (deferred by user from current provider scope due CAPTCHA/user gate)",
+      "required_evidence_class": "live_browser",
+      "status": "DEFERRED",
+      "evidence": [
+        {
+          "class": "live_browser",
+          "revision": "442572c",
+          "date": "2026-09-27",
+          "surface": "Microsoft Edge (user profile)",
+          "result": "DEFERRED",
+          "notes": "User observed FileMoon presents a captcha-gate__intro requiring a player click and explicitly chose to remove FileMoon for now. The current product does not automate or bypass that gate; FileMoon is removed from provider selection and from M5 completion acceptance."
+        }
+      ]
+    },
+    {
+      "id": "A-023",
+      "stage": "M3",
+      "criterion": "Auto mode attempts supported providers in priority order at most once per episode, fails over after terminal provider failure, and ends in NO_WORKING_PROVIDER after exhaustion; manual selection never changes provider",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "a623a3c",
+          "date": "2026-09-27",
+          "command": "npm test",
+          "result": "32/32 PASS",
+          "notes": "Covers VOE terminal startup failure -> Doodstream failover, per-episode attempt exclusion, NO_WORKING_PROVIDER after both providers fail, ledger reset on the next episode, and strict manual-provider behavior."
+        }
+      ]
+    },
+    {
+      "id": "A-M5-004",
+      "stage": "M5",
+      "criterion": "Current live Auto mode falls back from a terminally failing VOE/Doodstream provider to the next offered provider without user intervention, duplicate attempts, or focus stealing",
+      "required_evidence_class": "live_browser",
+      "status": "UNVERIFIED",
+      "evidence": []
+    }
+  ],
+  "evidence_rules": {
+    "fixture": "Deterministic saved/synthetic DOM evidence; does not prove current live-site compatibility.",
+    "test": "Automated deterministic logic/unit/integration evidence.",
+    "static": "Static/source inspection or enforced lint/gate evidence.",
+    "review": "Explicit implementation/configuration review against the criterion.",
+    "browser": "Executed Chrome/Chromium extension behavior in a browser environment.",
+    "live_browser": "Executed against the current real target/provider surface. Record date, URL/origin class, revision, observed result, and limitations."
+  },
+  "v0_4_2_first_install_permissions": {
+    "status": "IMPLEMENTED_LOCAL_VERIFIED_LIVE_PENDING",
+    "notes": "Known current VOE/Doodstream hosts are predeclared narrowly; unknown aliases retain exact runtime permission fallback."
+  },
+  "v0_4_3_serienstream_mirrors": {
+    "status": "IMPLEMENTED_LOCAL_VERIFIED_LIVE_PENDING",
+    "notes": "s.to and serienstream.cx are mirror host profiles of the same SerienStream adapter; current S.to-style data-play-url provider extraction is locally verified across all admitted mirror surfaces."
+  }
+}

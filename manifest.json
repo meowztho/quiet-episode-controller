@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "Quiet Episode Controller",
+  "version": "0.4.3",
+  "description": "Hands-off episode progression without OS mouse or keyboard automation.",
+  "permissions": [
+    "activeTab",
+    "debugger",
+    "scripting",
+    "storage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://aniworld.to/*",
+    "https://playmogo.com/*",
+    "https://serienstream.to/*",
+    "https://s.to/*",
+    "https://serienstream.cx/*",
+    "http://186.2.175.5/*",
+    "https://voe.sx/*",
+    "https://jeremyparticipantanything.com/*"
+  ],
+  "optional_host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "src/background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Quiet Episode Controller",
+    "default_popup": "src/ui/popup.html"
+  }
+}

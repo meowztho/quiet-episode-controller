@@ -1,0 +1,187 @@
+{
+  "schema": 1,
+  "master_outcome": "A user can intentionally arm a supported episode-site controller tab, then use another application while exactly one temporary provider playback tab per episode is opened, played, closed at media end, and the controller advances to the next episode without OS mouse/keyboard or foreground-focus automation.",
+  "scope": {
+    "episode_sites": [
+      "aniworld.to",
+      "serienstream.to",
+      "s.to",
+      "serienstream.cx",
+      "http://186.2.175.5/"
+    ],
+    "initial_provider_families": [
+      "VOE",
+      "DoodStream"
+    ],
+    "explicitly_out_of_scope": [
+      "media downloading or stream extraction",
+      "DRM or access-control circumvention",
+      "credential/login automation",
+      "OS-level mouse or keyboard simulation",
+      "coordinate-based automation"
+    ]
+  },
+  "outcomes": [
+    {
+      "id": "PR-01",
+      "name": "Session activation and stop",
+      "required": true,
+      "owner": "Session Core",
+      "stage": "M1",
+      "acceptance": [
+        "A-001",
+        "A-002"
+      ]
+    },
+    {
+      "id": "PR-02",
+      "name": "Episode-page discovery",
+      "required": true,
+      "owner": "Episode Site Adapter",
+      "stage": "M2",
+      "acceptance": [
+        "A-003",
+        "A-004"
+      ]
+    },
+    {
+      "id": "PR-03",
+      "name": "Canonical next-episode navigation",
+      "required": true,
+      "owner": "Episode Site Adapter",
+      "stage": "M2",
+      "acceptance": [
+        "A-005",
+        "A-006"
+      ]
+    },
+    {
+      "id": "PR-04",
+      "name": "Top-level provider playback surface and media control",
+      "required": true,
+      "owner": "Playback Surface + Provider Frame Agent",
+      "stage": "M3",
+      "acceptance": [
+        "A-007",
+        "A-008",
+        "A-009"
+      ]
+    },
+    {
+      "id": "PR-05",
+      "name": "Playback end drives progression",
+      "required": true,
+      "owner": "Session Core",
+      "stage": "M3",
+      "acceptance": [
+        "A-010",
+        "A-011"
+      ]
+    },
+    {
+      "id": "PR-06",
+      "name": "Fullscreen playback window mode",
+      "required": true,
+      "owner": "Window Controller",
+      "stage": "M4",
+      "acceptance": [
+        "A-012",
+        "A-013"
+      ]
+    },
+    {
+      "id": "PR-07",
+      "name": "Multi-episode continuity",
+      "required": true,
+      "owner": "Session Core",
+      "stage": "M6",
+      "acceptance": [
+        "A-014",
+        "A-015"
+      ]
+    },
+    {
+      "id": "PR-08",
+      "name": "Non-interference",
+      "required": true,
+      "owner": "Session Core",
+      "stage": "M4",
+      "acceptance": [
+        "A-016",
+        "A-017",
+        "A-018"
+      ]
+    },
+    {
+      "id": "PR-09",
+      "name": "Provider permission lifecycle",
+      "required": true,
+      "owner": "Permission Broker",
+      "stage": "M3",
+      "acceptance": [
+        "A-019",
+        "A-020"
+      ]
+    },
+    {
+      "id": "PR-10",
+      "name": "Passive blocked-state diagnostics",
+      "required": true,
+      "owner": "Status UI",
+      "stage": "M5",
+      "acceptance": [
+        "A-021",
+        "A-022"
+      ]
+    },
+    {
+      "id": "PR-11",
+      "name": "Bounded automatic provider failover",
+      "required": true,
+      "owner": "Session Core",
+      "stage": "M3",
+      "acceptance": [
+        "A-023",
+        "A-M5-004"
+      ]
+    }
+  ],
+  "responsibilities": [
+    {
+      "name": "Session state/lifecycle",
+      "owner": "Session Core"
+    },
+    {
+      "name": "Current/next episode resolution",
+      "owner": "Episode Site Adapter"
+    },
+    {
+      "name": "Provider identification",
+      "owner": "Provider Registry"
+    },
+    {
+      "name": "Temporary top-level provider tab lifecycle and current document origin",
+      "owner": "Playback Surface"
+    },
+    {
+      "name": "Media discovery/control/event observation",
+      "owner": "Provider Frame Agent"
+    },
+    {
+      "name": "Optional provider host access",
+      "owner": "Permission Broker"
+    },
+    {
+      "name": "Browser-window fullscreen",
+      "owner": "Window Controller"
+    },
+    {
+      "name": "Human-readable state/start/stop",
+      "owner": "Status UI"
+    },
+    {
+      "name": "Per-episode provider failover and attempt ledger",
+      "owner": "Session Core"
+    }
+  ]
+}

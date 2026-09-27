@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quiet Episode Controller — Project Atlas</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body data-source-hash="61505f4971fc63f98f877ee68a6c9228460e2c29cec86c856edafbdc4e65a2ef">
+<h1>Quiet Episode Controller — Project Atlas</h1>
+<p><strong>Generated view; non-authoritative.</strong></p>
+<p>Status: <strong>V0_4_3_SERIENSTREAM_MIRROR_LAYOUT_AWAITING_LIVE_VERIFICATION</strong> · Current stage:
+<strong>M3</strong> · Next admitted:
+<strong>M3</strong></p>
+<h2>Master outcome</h2>
+<p>A user can intentionally arm a supported episode-site controller tab, then use another application while exactly one temporary provider playback tab per episode is opened, played, closed at media end, and the controller advances to the next episode without OS mouse/keyboard or foreground-focus automation.</p>
+<h2>Product realization</h2>
+<table border="1" cellspacing="0" cellpadding="6">
+<tr><th>ID</th><th>Outcome</th><th>Owner</th><th>Stage</th><th>Acceptance status</th></tr>
+<tr><td>PR-01</td><td>Session activation and stop</td><td>Session Core</td><td>M1</td><td>VERIFIED, VERIFIED</td></tr><tr><td>PR-02</td><td>Episode-page discovery</td><td>Episode Site Adapter</td><td>M2</td><td>VERIFIED, VERIFIED</td></tr><tr><td>PR-03</td><td>Canonical next-episode navigation</td><td>Episode Site Adapter</td><td>M2</td><td>VERIFIED, VERIFIED</td></tr><tr><td>PR-04</td><td>Top-level provider playback surface and media control</td><td>Playback Surface + Provider Frame Agent</td><td>M3</td><td>VERIFIED, UNVERIFIED, UNVERIFIED</td></tr><tr><td>PR-05</td><td>Playback end drives progression</td><td>Session Core</td><td>M3</td><td>VERIFIED, VERIFIED</td></tr><tr><td>PR-06</td><td>Fullscreen playback window mode</td><td>Window Controller</td><td>M4</td><td>VERIFIED, UNVERIFIED</td></tr><tr><td>PR-07</td><td>Multi-episode continuity</td><td>Session Core</td><td>M6</td><td>UNVERIFIED, UNVERIFIED</td></tr><tr><td>PR-08</td><td>Non-interference</td><td>Session Core</td><td>M4</td><td>VERIFIED, VERIFIED, VERIFIED</td></tr><tr><td>PR-09</td><td>Provider permission lifecycle</td><td>Permission Broker</td><td>M3</td><td>VERIFIED, VERIFIED</td></tr><tr><td>PR-10</td><td>Passive blocked-state diagnostics</td><td>Status UI</td><td>M5</td><td>UNVERIFIED, UNVERIFIED</td></tr><tr><td>PR-11</td><td>Bounded automatic provider failover</td><td>Session Core</td><td>M3</td><td>VERIFIED, UNVERIFIED</td></tr>
+</table>
+<h2>Plan</h2>
+<table border="1" cellspacing="0" cellpadding="6">
+<tr><th>Stage</th><th>Name</th><th>Depends on</th><th>Goal</th></tr>
+<tr><td>M0</td><td>Repository and extension skeleton</td><td>—</td><td>Create the minimal MV3 extension shell, popup Start/Stop surface, service worker, test entrypoints, and no-op adapters without claiming playback behavior.</td></tr><tr><td>M1</td><td>Provider-neutral session core</td><td>M0</td><td>Implement the canonical session state machine and deterministic message/transition behavior against synthetic fixtures.</td></tr><tr><td>M2</td><td>Episode site adapter</td><td>M1</td><td>Implement and fixture-test the shared episode-site adapter for identity, provider candidates, and next-episode resolution.</td></tr><tr><td>M3</td><td>Provider playback surface capability</td><td>M1</td><td>Open one temporary top-level provider tab per episode, resolve its current origin, attach a player-technology-aware Provider Agent (JW Player 8 driver first, generic HTMLMediaElement fallback), enforce optional provider permission lifecycle, and deliver normalized media events.</td></tr><tr><td>M4</td><td>Non-interference and window mode</td><td>M1</td><td>Implement one-time browser-window fullscreen mode and prove ordinary progression does not use or steal OS input/focus.</td></tr><tr><td>M5</td><td>Live-provider admission</td><td>M2, M3, M4</td><td>Exercise current live supported pages/providers and implement passive blocked-state diagnostics for real policy/DOM failures.</td></tr><tr><td>M6</td><td>Representative multi-episode continuity</td><td>M5</td><td>Run representative multi-episode browser scenarios and prove continuity, loop prevention, stop behavior, and provider handoff.</td></tr>
+</table>
+</body>
+</html>

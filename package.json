@@ -1,0 +1,14 @@
+{
+  "name": "quiet-episode-controller",
+  "version": "0.4.3",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test tests/unit/*.test.js",
+    "test:fixture": "python tests/browser/run_dom_fixture_tests.py && python tests/browser/run_provider_fixture_tests.py",
+    "test:browser": "python tests/browser/run_browser_tests.py",
+    "validate:package": "python scripts/validate_extension_package.py",
+    "check": "npm test && npm run test:fixture && python scripts/static_check.py && npm run validate:package && python scripts/project_gate.py",
+    "build:release": "python scripts/build_release.py"
+  }
+}

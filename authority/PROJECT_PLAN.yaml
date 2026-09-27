@@ -1,0 +1,106 @@
+{
+  "schema": 1,
+  "stages": [
+    {
+      "id": "M0",
+      "name": "Repository and extension skeleton",
+      "depends_on": [],
+      "goal": "Create the minimal MV3 extension shell, popup Start/Stop surface, service worker, test entrypoints, and no-op adapters without claiming playback behavior.",
+      "acceptance": [
+        "A-M0-001",
+        "A-M0-002"
+      ],
+      "allowed_prework": []
+    },
+    {
+      "id": "M1",
+      "name": "Provider-neutral session core",
+      "depends_on": [
+        "M0"
+      ],
+      "goal": "Implement the canonical session state machine and deterministic message/transition behavior against synthetic fixtures.",
+      "acceptance": [
+        "A-001",
+        "A-002"
+      ]
+    },
+    {
+      "id": "M2",
+      "name": "Episode site adapter",
+      "depends_on": [
+        "M1"
+      ],
+      "goal": "Implement and fixture-test the shared episode-site adapter for identity, provider candidates, and next-episode resolution.",
+      "acceptance": [
+        "A-003",
+        "A-004",
+        "A-005",
+        "A-006"
+      ]
+    },
+    {
+      "id": "M3",
+      "name": "Provider playback surface capability",
+      "depends_on": [
+        "M1"
+      ],
+      "goal": "Open one temporary top-level provider tab per episode, resolve its current origin, attach a player-technology-aware Provider Agent (JW Player 8 driver first, generic HTMLMediaElement fallback), enforce optional provider permission lifecycle, and deliver normalized media events.",
+      "acceptance": [
+        "A-007",
+        "A-008",
+        "A-009",
+        "A-010",
+        "A-011",
+        "A-019",
+        "A-020",
+        "A-023"
+      ]
+    },
+    {
+      "id": "M4",
+      "name": "Non-interference and window mode",
+      "depends_on": [
+        "M1"
+      ],
+      "goal": "Implement one-time browser-window fullscreen mode and prove ordinary progression does not use or steal OS input/focus.",
+      "acceptance": [
+        "A-012",
+        "A-013",
+        "A-016",
+        "A-017",
+        "A-018"
+      ]
+    },
+    {
+      "id": "M5",
+      "name": "Live-provider admission",
+      "depends_on": [
+        "M2",
+        "M3",
+        "M4"
+      ],
+      "goal": "Exercise current live supported pages/providers and implement passive blocked-state diagnostics for real policy/DOM failures.",
+      "acceptance": [
+        "A-021",
+        "A-022",
+        "A-M5-001",
+        "A-M5-002",
+        "A-M5-004"
+      ]
+    },
+    {
+      "id": "M6",
+      "name": "Representative multi-episode continuity",
+      "depends_on": [
+        "M5"
+      ],
+      "goal": "Run representative multi-episode browser scenarios and prove continuity, loop prevention, stop behavior, and provider handoff.",
+      "acceptance": [
+        "A-014",
+        "A-015",
+        "A-M6-001"
+      ]
+    }
+  ],
+  "completion_rule": "All required Product Realization outcome acceptance criteria must be VERIFIED with evidence of the class required by ACCEPTANCE_EVIDENCE.yaml."
+}

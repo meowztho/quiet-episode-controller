@@ -1,0 +1,13 @@
+:root { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color-scheme: light dark; }
+body { margin: 0; min-width: 340px; }
+main { padding: 14px; display: grid; gap: 12px; }
+h1 { font-size: 16px; margin: 0; }
+.state { font-weight: 700; }
+.details { font-size: 12px; opacity: .8; min-height: 28px; white-space: pre-wrap; }
+.row { display: grid; grid-template-columns: 80px 1fr; align-items: center; gap: 8px; }
+.check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+button, select { font: inherit; }
+button { padding: 7px 12px; cursor: pointer; }
+.secondary { opacity: .8; }
+.error { color: #c33; font-size: 12px; min-height: 16px; }
