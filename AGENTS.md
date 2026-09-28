@@ -29,15 +29,15 @@ Preserve foreign changes. Never discard unrelated work.
 
 - No OS mouse movement.
 - No OS keyboard synthesis.
-- No coordinate automation.
+- No arbitrary/OS coordinate automation. Semantic Cast-control pointer clicks are admitted only under the bounded rules below.
 - No repeated focus stealing after session activation.
-- No media downloading, DRM circumvention, stream extraction, credential automation, or anti-access-control bypass.
+- No media downloading, DRM circumvention, general stream extraction, credential automation, or anti-access-control bypass. The only media-bearing exception is D-028: during same-provider JW Cast continuity, the next provider tab may relay its current provider-owned JW playlist item once, opaquely and transiently, to the retained Cast sender solely for `jwplayer().requestCast([item])`. QEC must not persist, log, inspect, reconstruct, or reuse its media fields, and must not construct `MediaInfo`/`LoadRequest` or call `loadMedia()` itself.
 - Provider-specific selectors/quirks stay in provider adapters.
 - Episode-site selectors/quirks stay in site adapters.
 - The Session Core consumes canonical adapter contracts; it must not know VOE/Doodstream/AniWorld DOM details.
 - Detect reusable player technology first (for example JW Player), use its native API/UI when available, and fall back to generic HTMLMediaElement control only when no supported player driver exists.
-- Keep the AniWorld controller tab stable and allow exactly one canonical temporary playback tab per episode; do not create extra playback windows/tabs outside that lifecycle.
-- Hands-free JW autoplay recovery may use the admitted `chrome.debugger` transport only through `src/providers/gesture-activation.js`, only against the canonical playback tab, and only for one fixed CDP Space rawKeyDown/keyUp pair; detach immediately after the pair. Other keys, mouse/pointer events, Network/DOM inspection, OS input, focus forcing, coordinates, and general debugger use are forbidden.
+- Keep the controller tab stable and allow exactly one canonical playback tab per episode. During D-028 Cast continuity only, one retiring sender tab may overlap with one next-episode helper tab until remote `PLAYING` or bounded fallback resolves the handoff; this overlap must not become a general multi-playback-tab lifecycle.
+- Privileged browser activation may use `chrome.debugger` only through `src/providers/gesture-activation.js` and only against the canonical playback tab. Admitted actions are: one fixed JW Space rawKeyDown/keyUp pair; one HTML5 `userGesture:true` play call on the already-marked canonical media; one retained-Cast pointer move/press/release targeted only at the visible semantic JW `.jw-icon-cast` control; one retained-HTML5-Cast pointer move/press/release targeted only at a visible semantic Cast control inside the already-marked canonical HTML5 player surface (`google-cast-launcher`, known player Cast-control classes, or Cast-labelled button); and, only when that HTML5 control is absent and silent `requestSessionById` is unavailable/exhausted, one `userGesture:true` call to the Cast MAIN-world bridge's fixed `__QEC_CAST_TRUSTED_REQUEST_SESSION__` entry point. That bridge may call only Google `CastContext.requestSession()` to open the Google-owned Cast session UI; QEC must not select a receiver or construct/load media. Detach immediately. Other keys, arbitrary pointer targets/coordinates, arbitrary Runtime.evaluate code, Network/DOM/Fetch/Storage inspection, OS input, focus forcing, and general debugger use are forbidden.
 - If unattended continuation is still blocked after the bounded trusted-activation attempt, enter a passive blocked state rather than escalating to intrusive input simulation.
 
 ## Verification

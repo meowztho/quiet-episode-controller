@@ -21,7 +21,12 @@ const state = {
   originShiftOnProviderInjection: null,
   debuggerAttaches: [],
   debuggerCommands: [],
-  debuggerDetaches: []
+  debuggerDetaches: [],
+  castHandoffResultMessages: [],
+  castRelayApplyMessages: [],
+  castRelayPromoteMessages: [],
+  castRelayFailureMessages: [],
+  castRemoteControlMessages: []
 };
 
 const probe = {
@@ -66,6 +71,11 @@ function reset(overrides = {}) {
   state.debuggerAttaches = [];
   state.debuggerCommands = [];
   state.debuggerDetaches = [];
+  state.castHandoffResultMessages = [];
+  state.castRelayApplyMessages = [];
+  state.castRelayPromoteMessages = [];
+  state.castRelayFailureMessages = [];
+  state.castRemoteControlMessages = [];
   Object.assign(state, overrides);
 }
 
@@ -89,6 +99,12 @@ globalThis.chrome = {
     },
     async sendCommand(target, method, params) {
       state.debuggerCommands.push({ target: structuredClone(target), method, params: structuredClone(params) });
+      if (method === "Runtime.evaluate" && params?.expression?.includes(".jw-icon-cast")) {
+        return { result: { type: "object", value: { ok: true, x: 300, y: 40, selector: ".jw-icon-cast", ariaLabel: "Cast" } } };
+      }
+      if (method === "Runtime.evaluate" && params?.expression?.includes(".vjs-chromecast-button")) {
+        return { result: { type: "object", value: { ok: true, x: 280, y: 42, selector: ".vjs-chromecast-button", ariaLabel: "Cast" } } };
+      }
       return { result: { type: "object", value: { ok: true, reason: null } } };
     },
     async detach(target) {
@@ -150,6 +166,26 @@ globalThis.chrome = {
         return { ok: true };
       }
       if (message.type === "PROVIDER_STOP") return { ok: true };
+      if (message.type === "CAST_HANDOFF_RESULT") {
+        state.castHandoffResultMessages.push({ tabId, message: structuredClone(message), options: structuredClone(options) });
+        return { ok: true };
+      }
+      if (message.type === "CAST_RELAY_APPLY") {
+        state.castRelayApplyMessages.push({ tabId, message: structuredClone(message), options: structuredClone(options) });
+        return { ok: true };
+      }
+      if (message.type === "CAST_RELAY_PROMOTE") {
+        state.castRelayPromoteMessages.push({ tabId, message: structuredClone(message), options: structuredClone(options) });
+        return { ok: true };
+      }
+      if (message.type === "CAST_RELAY_FAILED") {
+        state.castRelayFailureMessages.push({ tabId, message: structuredClone(message), options: structuredClone(options) });
+        return { ok: true };
+      }
+      if (message.type === "POPUP_CAST_REMOTE_CONTROL") {
+        state.castRemoteControlMessages.push({ tabId, message: structuredClone(message), options: structuredClone(options) });
+        return { ok: true };
+      }
       throw new Error(`unexpected tabs.sendMessage ${message.type}`);
     },
     async update(tabId, patch) {
@@ -220,25 +256,45 @@ test("controller tab stays open while a temporary playback tab handles media and
   assert.equal(state.attachMessages[0].tabId, 30);
   assert.equal(state.attachMessages[0].options.frameId, 0);
   const providerInjections = state.injections.filter((entry) =>
-    entry.files?.includes("src/providers/jw-main-bridge.js") || entry.files?.includes("src/providers/frame-agent.js")
+    entry.files?.includes("src/providers/cast-main-bridge.js") ||
+    entry.files?.includes("src/providers/jw-main-bridge.js") ||
+    entry.files?.includes("src/providers/frame-agent.js")
   );
+  assert.ok(providerInjections.some((entry) => entry.files?.includes("src/providers/cast-main-bridge.js") && entry.world === "MAIN"));
   assert.ok(providerInjections.some((entry) => entry.files?.includes("src/providers/jw-main-bridge.js") && entry.world === "MAIN"));
-  const firstBridge = providerInjections.findIndex((entry) => entry.files?.includes("src/providers/jw-main-bridge.js"));
+  const castBridge = providerInjections.findIndex((entry) => entry.files?.includes("src/providers/cast-main-bridge.js"));
+  const jwBridge = providerInjections.findIndex((entry) => entry.files?.includes("src/providers/jw-main-bridge.js"));
   const firstAgent = providerInjections.findIndex((entry) => entry.files?.includes("src/providers/frame-agent.js"));
-  assert.ok(firstBridge >= 0 && firstBridge < firstAgent, "JW MAIN-world bridge must be injected before the isolated provider agent");
+  assert.ok(castBridge >= 0 && castBridge < firstAgent, "Cast MAIN-world bridge must be injected before the isolated provider agent");
+  assert.ok(jwBridge >= 0 && jwBridge < firstAgent, "JW MAIN-world bridge must be injected before the isolated provider agent");
   assert.deepEqual(state.windowUpdates, [{ id: 20, state: "fullscreen" }]);
 
   const playing = message("MEDIA_PLAYING", { paused: false, readyState: 4 }, resumed.status.sessionId, resumed.status.epoch);
   await dispatch(playing, { tab: { id: 30 }, frameId: 0 });
   assert.equal(state.storage["qec.session"].state, "RUNNING");
 
-  const ended = message("MEDIA_ENDED", {}, resumed.status.sessionId, resumed.status.epoch);
+  const castStatus = message("CAST_STATUS", {
+    available: true,
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Wohnzimmer TV",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  }, resumed.status.sessionId, resumed.status.epoch);
+  await dispatch(castStatus, { tab: { id: 30 }, frameId: 0 });
+  assert.equal(state.storage["qec.session"].cast.sticky, true);
+  assert.equal(state.storage["qec.session"].cast.sessionId, "cast-123");
+
+  const ended = message("MEDIA_ENDED", { playerKind: "GoogleCast" }, resumed.status.sessionId, resumed.status.epoch);
   await dispatch(ended, { tab: { id: 30 }, frameId: 0 });
-  assert.deepEqual(state.removedTabs, [30], "finished provider tab must close");
+  let retained = state.storage["qec.session"];
+  assert.deepEqual(state.removedTabs, [], "sticky Cast keeps the old sender tab alive until the new sender is remote-playing");
+  assert.equal(retained.playbackTabId, null);
+  assert.equal(retained.retiringPlaybackTabId, 30);
   assert.deepEqual(state.tabUpdates, [
     { tabId: 30, active: true },
     { tabId: 10, url: probe.nextEpisode.url }
-  ], "controller advances after the already-activated playback tab finishes");
+  ], "controller advances while the previous Cast sender overlaps temporarily");
 
   await dispatch(ended, { tab: { id: 30 }, frameId: 0 });
   assert.equal(state.tabUpdates.length, 2, "duplicate ended event must not navigate twice");
@@ -258,11 +314,15 @@ test("controller tab stays open while a temporary playback tab handles media and
   assert.equal(persisted.playbackTabId, 31);
   assert.equal(state.createdTabs.length, 2, "next episode gets one fresh playback tab");
   assert.equal(state.attachMessages.length, 2);
+  assert.equal(state.attachMessages[1].message.payload.castSessionId, "cast-123", "next provider page receives the sticky Cast session id for rejoin");
+  assert.equal(state.attachMessages[1].message.payload.castReceiverApplicationId, "CC1AD845", "next provider page receives the retained Cast receiver app id before rejoin");
 
-  const playingNext = message("MEDIA_PLAYING", { paused: false, readyState: 4 }, persisted.sessionId, persisted.epoch);
+  const playingNext = message("MEDIA_PLAYING", { playerKind: "GoogleCast", mediaPlayerState: "PLAYING" }, persisted.sessionId, persisted.epoch);
   await dispatch(playingNext, { tab: { id: 31 }, frameId: 0 });
   persisted = state.storage["qec.session"];
   assert.equal(persisted.state, "RUNNING");
+  assert.equal(persisted.retiringPlaybackTabId, null);
+  assert.deepEqual(state.removedTabs, [30], "old sender closes only after the new Cast sender reaches MEDIA_PLAYING");
   assert.equal(state.windowUpdates.length, 1, "episode progression does not churn fullscreen");
   assert.equal("focused" in state.windowUpdates[0], false);
 
@@ -271,6 +331,215 @@ test("controller tab stays open while a temporary playback tab handles media and
   assert.equal(state.storage["qec.session"].state, "STOPPED");
   assert.ok(state.removedTabs.includes(31), "closing AniWorld controller must also close its playback tab");
   assert.deepEqual(state.windowUpdates.at(-1), { id: 20, state: "normal" });
+});
+
+test("retained Cast sender receives the next JW item transiently and becomes canonical again on remote play", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["VOE", "Doodstream"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", {
+    available: true,
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+  state.tabUpdatedListener?.(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  let persisted = state.storage["qec.session"];
+  assert.equal(persisted.playbackTabId, 31);
+  assert.equal(persisted.retiringPlaybackTabId, 30);
+  assert.equal(persisted.retiringPlaybackProvider, "VOE");
+  assert.equal(state.attachMessages[1].message.payload.castRelayMode, true);
+
+  const opaqueItem = {
+    title: "Episode 2",
+    file: "https://media.example.invalid/opaque-next.m3u8",
+    sources: [{ file: "https://media.example.invalid/opaque-next.m3u8", type: "hls" }]
+  };
+  await dispatch(message("CAST_RELAY_ITEM", { item: opaqueItem }, persisted.sessionId, persisted.epoch), { tab: { id: 31 }, frameId: 0 });
+
+  assert.equal(state.castRelayApplyMessages.length, 1);
+  assert.equal(state.castRelayApplyMessages[0].tabId, 30);
+  assert.deepEqual(state.castRelayApplyMessages[0].message.payload.item, opaqueItem);
+  const transferId = state.castRelayApplyMessages[0].message.payload.transferId;
+  assert.match(transferId, /:2:cast-relay$/);
+  assert.equal(JSON.stringify(state.storage).includes("media.example.invalid"), false, "opaque media details must never be persisted");
+  assert.equal(state.storage["qec.session"].cast.relayState, "TRANSFERRING");
+
+  await dispatch(message("CAST_RELAY_PLAYING", {
+    transferId,
+    playerKind: "GoogleCast",
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, 1), { tab: { id: 30 }, frameId: 0 });
+
+  persisted = state.storage["qec.session"];
+  assert.equal(persisted.state, "RUNNING");
+  assert.equal(persisted.playbackTabId, 30, "the proven Cast sender becomes canonical for the new episode");
+  assert.equal(persisted.retiringPlaybackTabId, null);
+  assert.equal(persisted.cast.relayState, "REMOTE");
+  assert.equal(persisted.cast.connected, true);
+  assert.equal(state.castRelayPromoteMessages.length, 1);
+  assert.equal(state.castRelayPromoteMessages[0].tabId, 30);
+  assert.deepEqual(state.removedTabs, [31], "the helper/source tab closes only after remote PLAYING");
+  assert.equal(JSON.stringify(state.storage).includes("media.example.invalid"), false);
+
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("Doodstream helper keeps the retiring Cast sender until remote confirmation or bounded rejoin failure", async () => {
+  reset({
+    grantedOrigins: new Set(["https://playmogo.com/*"]),
+    currentPlaybackUrl: "https://playmogo.com/e/dood-example",
+    currentPlaybackDocumentId: "doc-dood"
+  });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["Doodstream"]
+  }));
+
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "HTML5", paused: false, readyState: 4 }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", {
+    available: true,
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" },
+    providers: [
+      { key: "22", provider: "Doodstream", available: true, activation: { kind: "provider-navigation", target: "/redirect/22" } }
+    ]
+  };
+  state.currentPlaybackDocumentId = "doc-dood-next";
+  state.tabUpdatedListener?.(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  let persisted = state.storage["qec.session"];
+  assert.equal(persisted.playbackTabId, 31);
+  assert.equal(persisted.retiringPlaybackTabId, 30);
+  assert.equal(persisted.retiringPlaybackProvider, "Doodstream");
+  assert.equal(state.attachMessages[1].message.payload.castRelayMode, true);
+
+  await dispatch(message("MEDIA_PLAYING", {
+    playerKind: "HTML5",
+    paused: false,
+    readyState: 4
+  }, persisted.sessionId, persisted.epoch), { tab: { id: 31 }, frameId: 0 });
+
+  persisted = state.storage["qec.session"];
+  assert.equal(persisted.retiringPlaybackTabId, 30, "local helper playback must not retire the retained Cast sender");
+  assert.equal(persisted.playbackAuthority, "NONE", "local helper playback is not authoritative during retained Cast continuation");
+  assert.equal(state.removedTabs.includes(30), false);
+
+  await dispatch(message("CAST_STATUS", {
+    playerKind: "GoogleCast",
+    connected: false,
+    stickyResumeFailed: true,
+    stickyResumeReason: "CAST_RESUME_TIMEOUT"
+  }, persisted.sessionId, persisted.epoch), { tab: { id: 31 }, frameId: 0 });
+
+  persisted = state.storage["qec.session"];
+  assert.equal(persisted.retiringPlaybackTabId, null);
+  assert.equal(state.removedTabs.includes(30), true, "retiring sender closes only after the bounded Cast rejoin has failed");
+
+  await dispatch(message("POPUP_STOP"));
+});
+
+
+test("global active-session lock rejects Start from another tab", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const first = dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["VOE"]
+  }));
+  const second = dispatch(message("POPUP_START", {
+    tabId: 11,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["VOE"]
+  }));
+
+  const [firstResult, secondResult] = await Promise.all([first, second]);
+  const success = [firstResult, secondResult].find((result) => result?.ok === true);
+  const rejected = [firstResult, secondResult].find((result) => result?.ok === false);
+  assert.ok(success);
+  assert.equal(rejected?.error, "SESSION_ALREADY_ACTIVE");
+  assert.equal(state.createdTabs.length, 1, "concurrent Start must still create only one playback surface");
+  assert.equal(state.storage["qec.session"].lifecycle, "ACTIVE");
+
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("unexpected canonical playback-tab closure preserves the global session lock", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["VOE"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  state.tabRemovedListener?.(30);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  let persisted = state.storage["qec.session"];
+  assert.equal(persisted.lifecycle, "ACTIVE");
+  assert.equal(persisted.state, "BLOCKED");
+  assert.equal(persisted.blockedReason, "PLAYBACK_SURFACE_CLOSED");
+  assert.equal(persisted.playbackTabId, null);
+  assert.equal(persisted.playbackAuthority, "NONE");
+
+  const status = await dispatch(message("POPUP_GET_STATUS"));
+  assert.equal(status.status.lifecycle, "ACTIVE");
+  assert.equal(status.status.state, "BLOCKED");
+
+  const otherTabStart = await dispatch(message("POPUP_START", {
+    tabId: 11,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["VOE"]
+  }));
+  assert.equal(otherTabStart.ok, false);
+  assert.equal(otherTabStart.error, "SESSION_ALREADY_ACTIVE");
+  assert.equal(state.createdTabs.length, 1, "lost playback surface must not silently authorize a second session");
+
+  const stopped = await dispatch(message("POPUP_STOP"));
+  assert.equal(stopped.status.lifecycle, "ENDED");
+  assert.equal(stopped.status.state, "STOPPED");
 });
 
 test("existing provider permission survives a transient missing receiver in the top-level playback tab", async () => {
@@ -291,6 +560,7 @@ test("existing provider permission survives a transient missing receiver in the 
   assert.deepEqual(state.tabUpdates, [{ tabId: 30, active: true }]);
   assert.equal(state.attachMessages.length, 1);
   assert.equal(state.injections.filter((x) => x.files?.includes("src/providers/frame-agent.js")).length, 3);
+  assert.equal(state.injections.filter((x) => x.files?.includes("src/providers/cast-main-bridge.js") && x.world === "MAIN").length, 3);
   assert.equal(state.injections.filter((x) => x.files?.includes("src/providers/jw-main-bridge.js") && x.world === "MAIN").length, 3);
   assert.deepEqual(state.windowUpdates, []);
   await dispatch(message("POPUP_STOP"));
@@ -380,6 +650,110 @@ test("JW autoplay block gets one targeted background-tab Space recovery without 
   }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
   persisted = state.storage["qec.session"];
   assert.equal(persisted.state, "RUNNING");
+
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("retained JW Cast requests a trusted click on the provider-owned cast control", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["VOE", "Doodstream"]
+  }));
+
+  const session = state.storage["qec.session"];
+  session.cast = {
+    available: true, connected: true, sticky: true, sessionId: "cast-123",
+    deviceName: "Seb", receiverApplicationId: "CC1AD845", updatedAt: Date.now()
+  };
+  state.storage["qec.session"] = session;
+
+  await dispatch(message("CAST_HANDOFF_REQUIRED", {
+    playerKind: "JWPlayer",
+    handoffMethod: "TRUSTED_JW_CAST_CONTROL"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  assert.equal(state.debuggerAttaches.length, 1);
+  assert.equal(state.debuggerCommands[0].method, "Runtime.evaluate");
+  assert.match(state.debuggerCommands[0].params.expression, /\.jw-icon-cast/);
+  assert.deepEqual(state.debuggerCommands.slice(1).map((entry) => entry.method), [
+    "Input.dispatchMouseEvent", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent"
+  ]);
+  assert.equal(state.castHandoffResultMessages.length, 1);
+  assert.equal(state.castHandoffResultMessages[0].message.payload.ok, true);
+  assert.equal(state.castHandoffResultMessages[0].message.payload.target, ".jw-icon-cast");
+  assert.match(state.storage["qec.session"].diagnostics.at(-1), /trusted JW cast control triggered/);
+
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("retained HTML5 Cast can request one trusted Google Cast session UI activation", async () => {
+  reset({
+    grantedOrigins: new Set(["https://playmogo.com/*"]),
+    currentPlaybackUrl: "https://playmogo.com/e/dood-example",
+    currentPlaybackDocumentId: "doc-dood"
+  });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["Doodstream", "VOE"]
+  }));
+
+  await dispatch(message("CAST_HANDOFF_REQUIRED", {
+    playerKind: "HTML5",
+    handoffMethod: "TRUSTED_CAST_CONTEXT_REQUEST",
+    rejoinReason: "REQUEST_SESSION_BY_ID_UNAVAILABLE"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  assert.equal(state.debuggerAttaches.length, 1);
+  assert.equal(state.debuggerCommands.length, 1);
+  assert.equal(state.debuggerCommands[0].method, "Runtime.evaluate");
+  assert.equal(state.debuggerCommands[0].params.userGesture, true);
+  assert.match(state.debuggerCommands[0].params.expression, /__QEC_CAST_TRUSTED_REQUEST_SESSION__/);
+  assert.equal(state.castHandoffResultMessages.length, 1);
+  assert.equal(state.castHandoffResultMessages[0].message.payload.ok, true);
+  assert.equal(state.castHandoffResultMessages[0].message.payload.handoffMethod, "TRUSTED_CAST_CONTEXT_REQUEST");
+  assert.match(state.storage["qec.session"].diagnostics.at(-1), /trusted Google Cast session UI requested/);
+
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("retained HTML5 Cast can trigger the provider-owned semantic cast control", async () => {
+  reset({
+    grantedOrigins: new Set(["https://playmogo.com/*"]),
+    currentPlaybackUrl: "https://playmogo.com/e/dood-example",
+    currentPlaybackDocumentId: "doc-dood"
+  });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["Doodstream", "VOE"]
+  }));
+
+  await dispatch(message("CAST_HANDOFF_REQUIRED", {
+    playerKind: "HTML5",
+    handoffMethod: "TRUSTED_HTML5_CAST_CONTROL",
+    rejoinReason: "HTML5_CAST_SESSION_REJOINED"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  assert.equal(state.debuggerAttaches.length, 1);
+  assert.equal(state.debuggerCommands[0].method, "Runtime.evaluate");
+  assert.match(state.debuggerCommands[0].params.expression, /data-qec-canonical-media/);
+  assert.match(state.debuggerCommands[0].params.expression, /vjs-chromecast-button/);
+  assert.deepEqual(state.debuggerCommands.slice(1).map((entry) => entry.method), [
+    "Input.dispatchMouseEvent", "Input.dispatchMouseEvent", "Input.dispatchMouseEvent"
+  ]);
+  assert.equal(state.castHandoffResultMessages.length, 1);
+  assert.equal(state.castHandoffResultMessages[0].message.payload.ok, true);
+  assert.equal(state.castHandoffResultMessages[0].message.payload.handoffMethod, "TRUSTED_HTML5_CAST_CONTROL");
+  assert.match(state.storage["qec.session"].diagnostics.at(-1), /trusted HTML5 cast control triggered/);
 
   await dispatch(message("POPUP_STOP"));
 });
@@ -580,4 +954,57 @@ test("manual provider selection never runtime-fails over to another provider", a
   assert.deepEqual(state.removedTabs, []);
 
   await dispatch(message("POPUP_STOP"));
+});
+
+test("popup Cast remote controls route only to the canonical Cast playback surface", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10,
+    windowId: 20,
+    fullscreen: false,
+    providerPriority: ["VOE", "Doodstream"]
+  }));
+
+  const premature = await dispatch(message("POPUP_CAST_REMOTE_CONTROL", {
+    action: "TOGGLE_PLAY_PAUSE"
+  }));
+  assert.equal(premature.ok, false);
+  assert.equal(premature.error, "CAST_REMOTE_NOT_AUTHORITATIVE");
+  assert.equal(state.castRemoteControlMessages.length, 0);
+
+  await dispatch(message("CAST_STATUS", {
+    available: true,
+    connected: true,
+    sessionId: "cast-remote-1",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING",
+    isMediaLoaded: true,
+    remoteControlAvailable: true,
+    remoteCurrentTime: 41,
+    remoteDuration: 120
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  let persisted = state.storage["qec.session"];
+  assert.equal(persisted.playbackAuthority, "CAST");
+  assert.equal(persisted.cast.remoteControlAvailable, true);
+  assert.equal(persisted.cast.remoteCurrentTime, 41);
+  assert.equal(persisted.cast.remoteDuration, 120);
+
+  const seek = await dispatch(message("POPUP_CAST_REMOTE_CONTROL", {
+    action: "SEEK_RELATIVE",
+    seconds: 10
+  }));
+  assert.equal(seek.ok, true);
+  assert.equal(state.castRemoteControlMessages.length, 1);
+  assert.equal(state.castRemoteControlMessages[0].tabId, 30);
+  assert.equal(state.castRemoteControlMessages[0].options.frameId, 0);
+  assert.equal(state.castRemoteControlMessages[0].message.payload.action, "SEEK_RELATIVE");
+  assert.equal(state.castRemoteControlMessages[0].message.payload.seconds, 10);
+  assert.equal(state.castRemoteControlMessages[0].message.payload.castSessionId, "cast-remote-1");
+
+  await dispatch(message("POPUP_STOP"));
+  assert.equal(state.castRemoteControlMessages.length, 2, "Stop should best-effort stop remote Cast media before closing the sender");
+  assert.equal(state.castRemoteControlMessages[1].message.payload.action, "STOP");
 });

@@ -88,3 +88,12 @@ No formal compiler interview was required because the product intent was already
 **Context immediately accepted by the user:** `Auto` should switch from a failed provider to the next provider, try each provider at most once per episode, end in `NO_WORKING_PROVIDER` when all fail, and manual provider selection should remain strict.
 
 **Materialized into:** D-020; Session Core provider-attempt ledger; Provider Registry exclusions; Auto-only runtime failover tests and acceptance criteria.
+
+
+## 2026-09-28 — Google Cast continuity
+
+**User observation:** The provider player has its own Chromecast function. After handoff the local browser video visibly pauses, while the provider player controls can still control remote playback. Browser-level Cast behaves differently from casting from inside the player.
+
+**User decision:** Keep the provider/player Cast behavior. One initial native device picker is acceptable; afterward QEC should try to retain that chosen Cast device/session across the automated episode session.
+
+**Compiled meaning:** QEC may adopt and rejoin a provider-created Google Cast Web Sender session, but must not replace it with generic tab casting or extract/rebuild provider media requests.

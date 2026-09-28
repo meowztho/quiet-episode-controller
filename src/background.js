@@ -1,15 +1,23 @@
-import { envelope, isEnvelope, MessageType, PROTOCOL_VERSION, SessionState } from "./core/protocol.js";
+import { CastRemoteAction, envelope, isEnvelope, MessageType, PlaybackAuthority, PROTOCOL_VERSION, SessionLifecycle, SessionState } from "./core/protocol.js";
 import {
   acceptMessage,
+  beginCastRelay,
   beginEpisode,
   block,
+  clearCastRelay,
   clearPlaybackSurface,
+  clearRetiringPlaybackSurface,
   createSession,
+  isSessionActive,
+  markPlaybackSurfaceLost,
   markProviderAttached,
+  recordCastStatus,
   recordMedia,
   recordPlaybackActivationAttempt,
   recordProviderFailure,
   requireProviderPermission,
+  promoteRetiringPlaybackSurface,
+  retirePlaybackSurface,
   selectProvider,
   setPlaybackDocument,
   setPlaybackTab,
@@ -17,7 +25,13 @@ import {
 } from "./core/session.js";
 import { loadSession, saveSession } from "./core/session-store.js";
 import { chooseProvider, DEFAULT_PROVIDER_PRIORITY } from "./providers/registry.js";
-import { invokeTrustedHtml5Playback, invokeTrustedJwPlayback } from "./providers/gesture-activation.js";
+import {
+  invokeTrustedCastSessionRequest,
+  invokeTrustedHtml5Cast,
+  invokeTrustedHtml5Playback,
+  invokeTrustedJwCast,
+  invokeTrustedJwPlayback
+} from "./providers/gesture-activation.js";
 import {
   activatePlaybackSurface,
   closePlaybackSurface,
@@ -29,13 +43,15 @@ import { enterPlaybackMode, restorePlaybackMode } from "./window/window-controll
 
 const TOP_AGENT_FILES = ["src/sites/episode-site-adapter.js", "src/sites/episode-site-content.js"];
 const PROVIDER_AGENT_FILE = "src/providers/frame-agent.js";
+const CAST_MAIN_BRIDGE_FILE = "src/providers/cast-main-bridge.js";
 const JW_MAIN_BRIDGE_FILE = "src/providers/jw-main-bridge.js";
 const PROVIDER_ATTACH_ATTEMPTS = 20;
 const PROVIDER_ATTACH_INTERVAL_MS = 150;
 const PROVIDER_ORIGIN_HOP_LIMIT = 6;
 const PLAYBACK_NAVIGATION_TIMEOUT_MS = 10000;
 const PLAYBACK_NAVIGATION_INTERVAL_MS = 150;
-const SESSION_SCHEMA_VERSION = 4;
+const SESSION_SCHEMA_VERSION = 8;
+const CAST_REMOTE_ACTIONS = new Set(Object.values(CastRemoteAction));
 
 function newSessionId() {
   return crypto.randomUUID();
@@ -55,34 +71,44 @@ async function loadCurrentSession() {
 function publicStatus(session) {
   if (!session) {
     return {
+      lifecycle: SessionLifecycle.NONE,
       state: SessionState.IDLE,
+      playbackAuthority: PlaybackAuthority.NONE,
       sessionId: null,
       currentEpisode: null,
       nextEpisode: null,
       selectedProvider: null,
       playbackTabId: null,
+      retiringPlaybackTabId: null,
+      retiringPlaybackProvider: null,
       playbackDocument: null,
       pendingPermissionOrigin: null,
       blockedReason: null,
       providerFailoverEnabled: false,
       attemptedProviders: [],
       providerFailures: [],
+      cast: { available: false, connected: false, sticky: false, sessionId: null, deviceName: null },
       diagnostics: []
     };
   }
   return {
+    lifecycle: session.lifecycle,
     state: session.state,
+    playbackAuthority: session.playbackAuthority ?? PlaybackAuthority.NONE,
     sessionId: session.sessionId,
     epoch: session.epoch,
     tabId: session.tabId,
     windowId: session.windowId,
     playbackTabId: session.playbackTabId,
+    retiringPlaybackTabId: session.retiringPlaybackTabId ?? null,
+    retiringPlaybackProvider: session.retiringPlaybackProvider ?? null,
     currentEpisode: session.currentEpisode,
     nextEpisode: session.nextEpisode,
     selectedProvider: session.selectedProvider,
     providerFailoverEnabled: Boolean(session.providerFailoverEnabled),
     attemptedProviders: session.attemptedProviders ?? [],
     providerFailures: session.providerFailures ?? [],
+    cast: session.cast ?? { available: false, connected: false, sticky: false, sessionId: null, deviceName: null },
     playbackDocument: session.playbackDocument,
     playbackActivationAttempts: session.playbackActivationAttempts ?? 0,
     pendingPermissionOrigin: session.pendingPermissionOrigin,
@@ -131,6 +157,11 @@ async function injectAndHandshakeProvider(session, initialDocument) {
 
       await chrome.scripting.executeScript({
         target: { tabId: session.playbackTabId, frameIds: [0] },
+        files: [CAST_MAIN_BRIDGE_FILE],
+        world: "MAIN"
+      });
+      await chrome.scripting.executeScript({
+        target: { tabId: session.playbackTabId, frameIds: [0] },
         files: [JW_MAIN_BRIDGE_FILE],
         world: "MAIN"
       });
@@ -141,7 +172,17 @@ async function injectAndHandshakeProvider(session, initialDocument) {
 
       const response = await chrome.tabs.sendMessage(
         session.playbackTabId,
-        envelope(MessageType.PROVIDER_ATTACH, { provider: session.selectedProvider?.provider }, session),
+        envelope(MessageType.PROVIDER_ATTACH, {
+          provider: session.selectedProvider?.provider,
+          castSessionId: session.cast?.sticky ? session.cast?.sessionId : null,
+          castReceiverApplicationId: session.cast?.sticky ? session.cast?.receiverApplicationId : null,
+          castRelayMode: Boolean(
+            session.cast?.sticky &&
+            Number.isInteger(session.retiringPlaybackTabId) &&
+            session.retiringPlaybackProvider &&
+            session.retiringPlaybackProvider === session.selectedProvider?.provider
+          )
+        }, session),
         { frameId: 0 }
       );
       if (!response?.ok) throw new Error("PROVIDER_ATTACH_FAILED");
@@ -249,6 +290,7 @@ function providerFailureDiagnostics(session) {
 }
 
 async function blockNoWorkingProvider(session) {
+  session = await finishRetiringPlaybackTab(session);
   const reason = (session.attemptedProviders ?? []).length ? "NO_WORKING_PROVIDER" : "NO_PROVIDER_AVAILABLE";
   const blocked = block(session, reason, providerFailureDiagnostics(session));
   await saveSession(blocked);
@@ -346,7 +388,15 @@ async function prepareEpisode(session, { enterWindow = false } = {}) {
   }
 }
 
-async function handleStart(payload) {
+let startOperation = null;
+
+function existingActiveSessionResult(existing, tabId) {
+  if (!isSessionActive(existing)) return null;
+  if (existing.tabId === tabId) return publicStatus(existing);
+  throw new Error("SESSION_ALREADY_ACTIVE");
+}
+
+async function startSession(payload) {
   const {
     tabId,
     windowId,
@@ -357,10 +407,8 @@ async function handleStart(payload) {
   if (!Number.isInteger(tabId) || !Number.isInteger(windowId)) throw new Error("ACTIVE_TAB_REQUIRED");
 
   const existing = await loadCurrentSession();
-  if (existing && ![SessionState.STOPPED, SessionState.COMPLETED].includes(existing.state)) {
-    if (existing.tabId === tabId) return publicStatus(existing);
-    throw new Error("SESSION_ALREADY_ACTIVE");
-  }
+  const existingResult = existingActiveSessionResult(existing, tabId);
+  if (existingResult) return existingResult;
 
   let session = createSession({
     sessionId: newSessionId(),
@@ -375,11 +423,80 @@ async function handleStart(payload) {
   return publicStatus(session);
 }
 
+async function handleStart(payload) {
+  if (startOperation) {
+    try { await startOperation; } catch {}
+    const tabId = payload?.tabId;
+    const existing = await loadCurrentSession();
+    const existingResult = existingActiveSessionResult(existing, tabId);
+    if (existingResult) return existingResult;
+  }
+
+  const operation = startSession(payload);
+  startOperation = operation;
+  try {
+    return await operation;
+  } finally {
+    if (startOperation === operation) startOperation = null;
+  }
+}
+
+async function sendCastRemoteControl(session, payload = {}, { requireAuthority = true } = {}) {
+  const action = String(payload.action || "");
+  if (!CAST_REMOTE_ACTIONS.has(action)) throw new Error("CAST_REMOTE_ACTION_UNSUPPORTED");
+  if (!isSessionActive(session)) throw new Error("CAST_REMOTE_SESSION_INACTIVE");
+  if (requireAuthority && session.playbackAuthority !== PlaybackAuthority.CAST) {
+    throw new Error("CAST_REMOTE_NOT_AUTHORITATIVE");
+  }
+  if (!session.cast?.connected || !session.cast?.sessionId) throw new Error("CAST_REMOTE_NOT_CONNECTED");
+  if (!session.cast?.remoteControlAvailable) throw new Error("CAST_REMOTE_CONTROLLER_UNAVAILABLE");
+  if (!Number.isInteger(session.playbackTabId)) throw new Error("CAST_REMOTE_PLAYBACK_TAB_MISSING");
+
+  const seconds = Number(payload.seconds);
+  if ([CastRemoteAction.SEEK_RELATIVE, CastRemoteAction.SEEK_TO].includes(action) && !Number.isFinite(seconds)) {
+    throw new Error("CAST_REMOTE_SEEK_INVALID");
+  }
+
+  const response = await chrome.tabs.sendMessage(
+    session.playbackTabId,
+    envelope(MessageType.CAST_REMOTE_CONTROL, {
+      action,
+      seconds: Number.isFinite(seconds) ? seconds : null,
+      castSessionId: session.cast.sessionId
+    }, session),
+    { frameId: 0 }
+  );
+  if (!response?.ok) throw new Error(response?.reason || "CAST_REMOTE_CONTROL_FAILED");
+  return response;
+}
+
+async function handleCastRemoteControl(payload) {
+  let session = await loadCurrentSession();
+  const response = await sendCastRemoteControl(session, payload);
+  if (response?.status) {
+    session = recordCastStatus(session, response.status);
+    await saveSession(session);
+  }
+  return publicStatus(session);
+}
+
 async function handleStop() {
   let session = await loadCurrentSession();
   if (!session) return publicStatus(null);
 
   const playbackTabId = session.playbackTabId;
+  const retiringPlaybackTabId = session.retiringPlaybackTabId;
+  if (
+    isSessionActive(session) &&
+    session.playbackAuthority === PlaybackAuthority.CAST &&
+    session.cast?.connected &&
+    session.cast?.remoteControlAvailable &&
+    Number.isInteger(playbackTabId)
+  ) {
+    try {
+      await sendCastRemoteControl(session, { action: CastRemoteAction.STOP });
+    } catch {}
+  }
   session = stop(session);
   await saveSession(session);
 
@@ -388,6 +505,10 @@ async function handleStop() {
       await chrome.tabs.sendMessage(playbackTabId, envelope(MessageType.PROVIDER_STOP, {}, session), { frameId: 0 });
     } catch {}
     await closePlaybackSurface(playbackTabId);
+  }
+
+  if (Number.isInteger(retiringPlaybackTabId) && retiringPlaybackTabId !== playbackTabId) {
+    await closePlaybackSurface(retiringPlaybackTabId);
   }
 
   await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
@@ -424,15 +545,205 @@ async function finishPlaybackTab(session) {
   return session;
 }
 
+async function retireCurrentPlaybackTab(session) {
+  session = retirePlaybackSurface(session);
+  await saveSession(session);
+  return session;
+}
+
+async function finishRetiringPlaybackTab(session) {
+  const retiringPlaybackTabId = session?.retiringPlaybackTabId;
+  if (!Number.isInteger(retiringPlaybackTabId)) return clearCastRelay(session);
+  session = clearCastRelay(session);
+  session = clearRetiringPlaybackSurface(session);
+  await saveSession(session);
+  await closePlaybackSurface(retiringPlaybackTabId);
+  return session;
+}
+
+async function notifyCastRelayFailure(session, reason) {
+  const playbackTabId = session?.playbackTabId;
+  if (!Number.isInteger(playbackTabId)) return;
+  try {
+    await chrome.tabs.sendMessage(
+      playbackTabId,
+      envelope(MessageType.CAST_RELAY_FAILED, { reason }, session),
+      { frameId: 0 }
+    );
+  } catch {}
+}
+
+async function handleCastRelayItem(message, sender) {
+  let session = await loadCurrentSession();
+  const tabId = sender.tab?.id;
+  if (!acceptMessage(session, { sessionId: message.sessionId, epoch: message.epoch, tabId })) return;
+  if (sender.frameId !== 0) return;
+  const item = message.payload?.item;
+  const retiringTabId = session.retiringPlaybackTabId;
+  const sameProvider = Boolean(
+    session.retiringPlaybackProvider &&
+    session.retiringPlaybackProvider === session.selectedProvider?.provider
+  );
+  if (!item || typeof item !== "object" || !session.cast?.sticky || !Number.isInteger(retiringTabId) || !sameProvider) {
+    await notifyCastRelayFailure(session, "CAST_RELAY_NOT_AVAILABLE");
+    return;
+  }
+
+  const relayToken = `${session.sessionId}:${session.epoch}:cast-relay`;
+  session = beginCastRelay(session, relayToken);
+  session = recordCastStatus(session, { traceEvent: "CAST_RELAY_ITEM_READY" });
+  await saveSession(session);
+
+  try {
+    const response = await chrome.tabs.sendMessage(
+      retiringTabId,
+      envelope(MessageType.CAST_RELAY_APPLY, { transferId: relayToken, item }, session),
+      { frameId: 0 }
+    );
+    if (!response?.ok) throw new Error(response?.reason || "CAST_RELAY_APPLY_FAILED");
+    session = await loadCurrentSession();
+    if (session?.cast?.relayToken === relayToken) {
+      session = recordCastStatus(session, { traceEvent: "CAST_RELAY_DELIVERED" });
+      await saveSession(session);
+    }
+  } catch (error) {
+    session = await loadCurrentSession();
+    if (session?.cast?.relayToken === relayToken) {
+      session = clearCastRelay(session, "FAILED");
+      session = recordCastStatus(session, { traceEvent: "CAST_RELAY_DELIVERY_FAILED" });
+      await saveSession(session);
+      await notifyCastRelayFailure(session, String(error?.message || error || "CAST_RELAY_DELIVERY_FAILED"));
+    }
+  }
+}
+
+async function handleCastRelayPlaying(message, sender) {
+  let session = await loadCurrentSession();
+  const tabId = sender.tab?.id;
+  const transferId = String(message.payload?.transferId || "");
+  if (!session || sender.frameId !== 0 || tabId !== session.retiringPlaybackTabId) return;
+  if (!transferId || transferId !== session.cast?.relayToken) return;
+
+  const sourceTabId = session.playbackTabId;
+  const senderDocument = await currentPlaybackDocument(tabId).catch(() => null);
+  session = recordCastStatus(session, {
+    ...message.payload,
+    connected: true,
+    sessionId: message.payload?.sessionId || session.cast?.sessionId,
+    deviceName: message.payload?.deviceName || session.cast?.deviceName,
+    receiverApplicationId: message.payload?.receiverApplicationId || session.cast?.receiverApplicationId,
+    traceEvent: "CAST_RELAY_REMOTE_PLAYING"
+  });
+  session = recordMedia(session, MessageType.MEDIA_PLAYING, {
+    ...message.payload,
+    playerKind: "GoogleCast",
+    relayTransfer: true
+  }).session;
+  session = promoteRetiringPlaybackSurface(session, senderDocument);
+  await saveSession(session);
+
+  try {
+    await chrome.tabs.sendMessage(
+      session.playbackTabId,
+      envelope(MessageType.CAST_RELAY_PROMOTE, {
+        provider: session.selectedProvider?.provider,
+        castSessionId: session.cast?.sessionId,
+        castReceiverApplicationId: session.cast?.receiverApplicationId
+      }, session),
+      { frameId: 0 }
+    );
+  } catch {}
+
+  if (Number.isInteger(sourceTabId) && sourceTabId !== session.playbackTabId) {
+    await closePlaybackSurface(sourceTabId);
+  }
+}
+
+async function handleCastRelayFailed(message, sender) {
+  let session = await loadCurrentSession();
+  const tabId = sender.tab?.id;
+  const transferId = String(message.payload?.transferId || "");
+  if (!session || sender.frameId !== 0 || tabId !== session.retiringPlaybackTabId) return;
+  if (!transferId || transferId !== session.cast?.relayToken) return;
+  session = clearCastRelay(session, "FAILED");
+  session = recordCastStatus(session, { traceEvent: "CAST_RELAY_FAILED" });
+  await saveSession(session);
+  await notifyCastRelayFailure(session, message.payload?.reason || "CAST_RELAY_FAILED");
+}
+
 async function handleMediaMessage(message, sender) {
   let session = await loadCurrentSession();
   const tabId = sender.tab?.id;
   if (!acceptMessage(session, { sessionId: message.sessionId, epoch: message.epoch, tabId })) return;
   if (sender.frameId !== 0) return;
 
+  if (message.type === MessageType.CAST_STATUS) {
+    session = recordCastStatus(session, message.payload);
+    await saveSession(session);
+    if (message.payload?.stickyResumeFailed && Number.isInteger(session.retiringPlaybackTabId)) {
+      session = await finishRetiringPlaybackTab(session);
+    }
+    return;
+  }
+
+  if (message.type === MessageType.CAST_HANDOFF_REQUIRED) {
+    const handoffMethod = String(message.payload?.handoffMethod || "");
+    let activation;
+    let successDiagnostic;
+    let failureReason;
+
+    if (message.payload?.playerKind === "JWPlayer" && handoffMethod === "TRUSTED_JW_CAST_CONTROL") {
+      activation = await invokeTrustedJwCast(tabId);
+      successDiagnostic = `cast-handoff: trusted JW cast control triggered (${activation.target || "jw"})`;
+      failureReason = "JW_CAST_TRIGGER_FAILED";
+    } else if (message.payload?.playerKind === "HTML5" && handoffMethod === "TRUSTED_HTML5_CAST_CONTROL") {
+      activation = await invokeTrustedHtml5Cast(tabId);
+      successDiagnostic = `cast-handoff: trusted HTML5 cast control triggered (${activation.target || "html5"})`;
+      failureReason = "HTML5_CAST_TRIGGER_FAILED";
+    } else if (message.payload?.playerKind === "HTML5" && handoffMethod === "TRUSTED_CAST_CONTEXT_REQUEST") {
+      activation = await invokeTrustedCastSessionRequest(tabId);
+      successDiagnostic = "cast-handoff: trusted Google Cast session UI requested";
+      failureReason = "CAST_CONTEXT_REQUEST_FAILED";
+    } else {
+      return;
+    }
+
+    session = {
+      ...session,
+      diagnostics: [
+        ...(session.diagnostics || []),
+        activation.ok
+          ? successDiagnostic
+          : `cast-handoff: ${activation.reason || failureReason}`
+      ],
+      updatedAt: Date.now()
+    };
+    await saveSession(session);
+    try {
+      await chrome.tabs.sendMessage(
+        tabId,
+        envelope(MessageType.CAST_HANDOFF_RESULT, { ...activation, handoffMethod }, session),
+        { frameId: 0 }
+      );
+    } catch {}
+    return;
+  }
+
   const result = recordMedia(session, message.type, message.payload);
   session = result.session;
   await saveSession(session);
+
+  if (message.type === MessageType.MEDIA_PLAYING && Number.isInteger(session.retiringPlaybackTabId)) {
+    if (message.payload?.playerKind === "GoogleCast") {
+      session = clearCastRelay(session, "REMOTE");
+      await saveSession(session);
+      session = await finishRetiringPlaybackTab(session);
+    } else if (!session.cast?.sticky) {
+      session = clearCastRelay(session, "LOCAL_FALLBACK");
+      await saveSession(session);
+      session = await finishRetiringPlaybackTab(session);
+    }
+  }
 
   const blockedReason = message.payload?.reason;
   const activationEligible =
@@ -482,13 +793,21 @@ async function handleMediaMessage(message, sender) {
   }
 
   if (result.action?.type === "NAVIGATE_NEXT") {
-    session = await finishPlaybackTab(session);
+    const isStickyCastEnd = Boolean(
+      message.payload?.playerKind === "GoogleCast" &&
+      session.cast?.sticky &&
+      Number.isInteger(session.playbackTabId)
+    );
+    session = isStickyCastEnd
+      ? await retireCurrentPlaybackTab(session)
+      : await finishPlaybackTab(session);
     await chrome.tabs.update(session.tabId, { url: result.action.target.url });
     return;
   }
 
   if (result.action?.type === "COMPLETE") {
     session = await finishPlaybackTab(session);
+    session = await finishRetiringPlaybackTab(session);
     await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
   }
 }
@@ -504,8 +823,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         return { ok: true, version: PROTOCOL_VERSION, status: await handleStart(message.payload) };
       case MessageType.STOP:
         return { ok: true, version: PROTOCOL_VERSION, status: await handleStop() };
+      case MessageType.CAST_REMOTE_CONTROL:
+        return { ok: true, version: PROTOCOL_VERSION, status: await handleCastRemoteControl(message.payload) };
       case MessageType.PERMISSION_GRANTED:
         return { ok: true, version: PROTOCOL_VERSION, status: await handlePermissionGranted() };
+      case MessageType.CAST_RELAY_ITEM:
+        await handleCastRelayItem(message, sender);
+        return { ok: true, version: PROTOCOL_VERSION };
+      case MessageType.CAST_RELAY_PLAYING:
+        await handleCastRelayPlaying(message, sender);
+        return { ok: true, version: PROTOCOL_VERSION };
+      case MessageType.CAST_RELAY_FAILED:
+        await handleCastRelayFailed(message, sender);
+        return { ok: true, version: PROTOCOL_VERSION };
       case MessageType.MEDIA_FOUND:
       case MessageType.MEDIA_PLAYING:
       case MessageType.MEDIA_ENDED:
@@ -513,6 +843,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MessageType.MEDIA_STALLED:
       case MessageType.MEDIA_PLAY_BLOCKED:
       case MessageType.MEDIA_REPLACED:
+      case MessageType.CAST_STATUS:
+      case MessageType.CAST_HANDOFF_REQUIRED:
         await handleMediaMessage(message, sender);
         return { ok: true, version: PROTOCOL_VERSION };
       default:
@@ -537,21 +869,37 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   (async () => {
     let session = await loadCurrentSession();
-    if (!session || [SessionState.STOPPED, SessionState.COMPLETED].includes(session.state)) return;
+    if (!isSessionActive(session)) return;
 
     if (session.tabId === tabId) {
       const playbackTabId = session.playbackTabId;
+      const retiringPlaybackTabId = session.retiringPlaybackTabId;
       session = stop(session);
       await saveSession(session);
       if (Number.isInteger(playbackTabId)) await closePlaybackSurface(playbackTabId);
+      if (Number.isInteger(retiringPlaybackTabId) && retiringPlaybackTabId !== playbackTabId) {
+        await closePlaybackSurface(retiringPlaybackTabId);
+      }
       await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
       return;
     }
 
     if (session.playbackTabId === tabId) {
-      session = stop(session);
+      const hasRetiringSender = Number.isInteger(session.retiringPlaybackTabId);
+      session = markPlaybackSurfaceLost(session);
       await saveSession(session);
-      await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
+      if (!hasRetiringSender) {
+        await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
+      }
+      return;
+    }
+
+    if (session.retiringPlaybackTabId === tabId) {
+      const hadRelay = Boolean(session.cast?.relayToken);
+      session = clearCastRelay(session, hadRelay ? "FAILED" : session.cast?.relayState ?? null);
+      session = clearRetiringPlaybackSurface(session);
+      await saveSession(session);
+      if (hadRelay) await notifyCastRelayFailure(session, "CAST_RELAY_SENDER_CLOSED");
     }
   })().catch(() => {});
 });

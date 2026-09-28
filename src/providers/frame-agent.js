@@ -11,8 +11,12 @@
   const START_BUTTON_ID = "__qec_start_button__";
   const CANONICAL_MEDIA_ATTR = "data-qec-canonical-media";
   const JW_CHANNEL = "__QEC_JW_BRIDGE_V1__";
+  const CAST_CHANNEL = "__QEC_CAST_BRIDGE_V1__";
   const JW_PLAY_RETRY_INTERVAL_MS = 700;
   const JW_PLAY_START_TIMEOUT_MS = 12000;
+  const JW_TRUSTED_ESCALATION_MS = 1200;
+  const STICKY_CAST_RESUME_TIMEOUT_MS = 6000;
+  const CAST_REMOTE_COMMAND_TIMEOUT_MS = 1500;
 
   let config = null;
   let observer = null;
@@ -23,6 +27,7 @@
   let startupDeadline = 0;
   let startupAttempt = 0;
   let startupInFlight = false;
+  let startupEscalationEmitted = false;
   let lastPlayError = null;
   let playingObserved = false;
   let controlsRoot = null;
@@ -35,8 +40,19 @@
   let jwStartupDeadline = 0;
   let jwStartupAttempt = 0;
   let jwPlayingObserved = false;
+  let jwEscalationTimerId = null;
+  let jwEscalationEmitted = false;
   let jwFoundEmitted = false;
   let lastJwStatus = null;
+  let stickyCastResumeState = "idle";
+  let stickyCastConnected = false;
+  let stickyCastTransferRequested = false;
+  let stickyCastResumeTimerId = null;
+  let stickyCastInteractiveRejoinReason = null;
+  let castRelayItemRequested = false;
+  let activeCastRelayTransferId = null;
+  let castRemoteCommandSequence = 0;
+  const pendingCastRemoteCommands = new Map();
   const listeners = new Map();
 
   function emit(type, payload = {}) {
@@ -171,11 +187,132 @@
     };
   }
 
+  function clearStickyCastResumeTimer() {
+    if (stickyCastResumeTimerId) clearTimeout(stickyCastResumeTimerId);
+    stickyCastResumeTimerId = null;
+  }
+
+  function stickyCastRequested() {
+    return Boolean(config?.castSessionId);
+  }
+
+  function shouldDeferLocalPlayback() {
+    return stickyCastRequested() && ["pending", "html5_native_trigger", "context_trigger", "transferring", "awaiting_remote", "remote", "relay_pending", "relay_exporting", "relay_transfer"].includes(stickyCastResumeState);
+  }
+
+  function maybeOfferCastRelay() {
+    if (!config?.castRelayMode || !stickyCastRequested()) return false;
+    if (castRelayItemRequested || stickyCastResumeState === "remote" || stickyCastResumeState === "failed") return false;
+    if (currentPlayerKind !== "jw" || !currentJwContainer) return false;
+    castRelayItemRequested = true;
+    stickyCastResumeState = "relay_exporting";
+    sendJwCommand("EXPORT_CAST_ITEM");
+    return true;
+  }
+
+  function switchHtml5StickyCastToRejoin() {
+    if (!config?.castRelayMode || !stickyCastRequested() || currentPlayerKind !== "html5") return false;
+
+    // D-028's opaque playlist-item relay is a JW-only capability. A provider
+    // backed by plain HTML5 must not attempt to export/inspect media. Keep the
+    // retiring sender alive, rejoin the retained Cast session through the
+    // provider-owned Cast framework, and wait for real REMOTE_PLAYING before
+    // allowing the old sender to be retired. If that bounded rejoin fails, the
+    // existing sticky-cast timeout releases local playback as the fallback.
+    config.castRelayMode = false;
+    stickyCastResumeState = "pending";
+    emit("CAST_STATUS", {
+      playerKind: "GoogleCast",
+      traceEvent: "HTML5_CAST_REJOIN"
+    });
+    sendCastCommand("REJOIN_SESSION", {
+      sessionId: config.castSessionId,
+      receiverApplicationId: config.castReceiverApplicationId || null
+    });
+    return true;
+  }
+
+  function requestTrustedHtml5CastContext(reason) {
+    if (!stickyCastRequested() || currentPlayerKind !== "html5" || config?.castRelayMode) return false;
+    if (["context_trigger", "remote", "failed"].includes(stickyCastResumeState)) return false;
+
+    stickyCastInteractiveRejoinReason = reason || "CAST_REJOIN_INTERACTION_REQUIRED";
+    stickyCastResumeState = "context_trigger";
+    emit("CAST_STATUS", {
+      playerKind: "GoogleCast",
+      traceEvent: "HTML5_CAST_CONTEXT_REQUEST"
+    });
+    emit("CAST_HANDOFF_REQUIRED", {
+      playerKind: "HTML5",
+      handoffMethod: "TRUSTED_CAST_CONTEXT_REQUEST",
+      rejoinReason: stickyCastInteractiveRejoinReason
+    });
+    return true;
+  }
+
+  function requestTrustedHtml5CastControl(reason) {
+    if (!stickyCastRequested() || currentPlayerKind !== "html5" || config?.castRelayMode) return false;
+    if (stickyCastResumeState !== "pending") return false;
+
+    stickyCastInteractiveRejoinReason = reason || "HTML5_CAST_CONTROL_REQUIRED";
+    stickyCastResumeState = "html5_native_trigger";
+    emit("CAST_STATUS", {
+      playerKind: "GoogleCast",
+      traceEvent: "HTML5_CAST_CONTROL_REQUEST"
+    });
+    emit("CAST_HANDOFF_REQUIRED", {
+      playerKind: "HTML5",
+      handoffMethod: "TRUSTED_HTML5_CAST_CONTROL",
+      rejoinReason: stickyCastInteractiveRejoinReason
+    });
+    return true;
+  }
+
+  function fallBackFromStickyCast(reason) {
+    if (!stickyCastRequested() || stickyCastResumeState === "remote" || stickyCastResumeState === "failed") return;
+    clearStickyCastResumeTimer();
+    stickyCastResumeState = "failed";
+    emit("CAST_STATUS", {
+      playerKind: "GoogleCast",
+      connected: false,
+      stickyResumeFailed: true,
+      stickyResumeReason: reason
+    });
+    if (currentPlayerKind === "jw" && currentJwContainer && !jwPlayingObserved) startJwPlaybackStartup();
+    else if (currentPlayerKind === "html5" && currentVideo && !playingObserved) startPlaybackStartup(currentVideo);
+  }
+
+  function armStickyCastResumeTimeout() {
+    clearStickyCastResumeTimer();
+    if (!stickyCastRequested()) return;
+    stickyCastResumeTimerId = setTimeout(() => {
+      stickyCastResumeTimerId = null;
+      fallBackFromStickyCast("CAST_RESUME_TIMEOUT");
+    }, STICKY_CAST_RESUME_TIMEOUT_MS);
+  }
+
+  function maybeTransferStickyCast() {
+    if (!stickyCastRequested()) return false;
+    if (stickyCastTransferRequested || stickyCastResumeState === "remote" || stickyCastResumeState === "failed") return false;
+    if (!stickyCastConnected) return false;
+    if (currentPlayerKind !== "jw" || !currentJwContainer) return false;
+    stickyCastTransferRequested = true;
+    stickyCastResumeState = "native_trigger";
+    emit("CAST_HANDOFF_REQUIRED", {
+      playerKind: "JWPlayer",
+      handoffMethod: "TRUSTED_JW_CAST_CONTROL"
+    });
+    return true;
+  }
+
   function clearJwStartup() {
     if (jwStartupTimerId) clearTimeout(jwStartupTimerId);
+    if (jwEscalationTimerId) clearTimeout(jwEscalationTimerId);
     jwStartupTimerId = null;
+    jwEscalationTimerId = null;
     jwStartupDeadline = 0;
     jwStartupAttempt = 0;
+    jwEscalationEmitted = false;
   }
 
   function scheduleJwStart(delay = JW_PLAY_RETRY_INTERVAL_MS) {
@@ -200,7 +337,27 @@
     clearJwStartup();
     jwPlayingObserved = false;
     jwStartupDeadline = Date.now() + JW_PLAY_START_TIMEOUT_MS;
-    scheduleJwStart(0);
+
+    // Try ordinary JW play immediately. Hidden-page timers are throttled in
+    // Chromium, so do not put attempt #1 behind setTimeout(0).
+    jwStartupAttempt += 1;
+    sendJwCommand("PLAY");
+
+    // Escalate early to the already-bounded trusted activation path if ordinary
+    // provider play has not produced a real PLAY/FIRST_FRAME event. Keep the
+    // long deadline only as a final verification/failover bound.
+    jwEscalationTimerId = setTimeout(() => {
+      jwEscalationTimerId = null;
+      if (currentPlayerKind !== "jw" || jwPlayingObserved || jwEscalationEmitted) return;
+      jwEscalationEmitted = true;
+      emit("MEDIA_PLAY_BLOCKED", {
+        reason: "PLAY_START_TIMEOUT",
+        startupPhase: "EARLY_TRUSTED_ESCALATION",
+        ...normalizeJwStatus(lastJwStatus || {})
+      });
+    }, JW_TRUSTED_ESCALATION_MS);
+
+    scheduleJwStart(JW_PLAY_RETRY_INTERVAL_MS);
   }
 
   function detachJw() {
@@ -226,7 +383,9 @@
       height: Math.max(1, Math.round(Number(window.innerHeight || document.documentElement?.clientHeight || 720)))
     });
     sendJwCommand("PROBE");
-    startJwPlaybackStartup();
+    if (!shouldDeferLocalPlayback()) startJwPlaybackStartup();
+    else if (config?.castRelayMode) maybeOfferCastRelay();
+    else maybeTransferStickyCast();
   }
 
   function handleJwBridgeMessage(event) {
@@ -252,10 +411,20 @@
           jwFoundEmitted = true;
           emit("MEDIA_FOUND", status);
         }
-        if (!jwPlayingObserved && !jwStartupTimerId) startJwPlaybackStartup();
+        if (shouldDeferLocalPlayback()) {
+          if (config?.castRelayMode) maybeOfferCastRelay();
+          else maybeTransferStickyCast();
+        } else if (!jwPlayingObserved && !jwStartupTimerId) startJwPlaybackStartup();
         break;
       case "PLAY":
       case "FIRST_FRAME":
+        if (shouldDeferLocalPlayback()) {
+          // A provider may autostart locally before the retained Cast session
+          // has accepted the new item. Keep local media silent/paused until
+          // the Cast handoff succeeds or the bounded resume attempt fails.
+          sendJwCommand("PAUSE");
+          break;
+        }
         if (!jwPlayingObserved) {
           jwPlayingObserved = true;
           clearJwStartup();
@@ -265,6 +434,68 @@
       case "COMPLETE":
         clearJwStartup();
         emit("MEDIA_ENDED", status);
+        break;
+      case "CAST": {
+        const castEvent = data.payload?.eventData || {};
+        emit("CAST_STATUS", {
+          playerKind: "GoogleCast",
+          jwCastEvent: true,
+          jwCastActive: Boolean(castEvent.active),
+          jwCastAvailable: Boolean(castEvent.available),
+          jwCastDeviceName: castEvent.deviceName || null,
+          // JW's player-level active flag is diagnostic only. A usable Cast
+          // connection/session identity is owned by the Cast framework bridge.
+          traceEvent: castEvent.active ? "JW_CAST_ACTIVE" : "JW_CAST_INACTIVE"
+        });
+        if (stickyCastRequested() && castEvent.active && !config?.castRelayMode) {
+          stickyCastResumeState = "awaiting_remote";
+        }
+        break;
+      }
+      case "CAST_ITEM_EXPORT": {
+        if (!config?.castRelayMode || !stickyCastRequested()) break;
+        const item = data.payload?.item;
+        if (!item || typeof item !== "object") {
+          fallBackFromStickyCast("JW_CAST_RELAY_ITEM_INVALID");
+          break;
+        }
+        stickyCastResumeState = "relay_transfer";
+        emit("CAST_RELAY_ITEM", { item });
+        break;
+      }
+      case "CAST_ITEM_EXPORT_FAILED":
+        if (config?.castRelayMode) fallBackFromStickyCast(data.payload?.reason || "JW_CAST_RELAY_ITEM_UNAVAILABLE");
+        break;
+      case "CAST_RELAY_REQUESTED":
+        if (activeCastRelayTransferId && data.payload?.transferId === activeCastRelayTransferId) {
+          emit("CAST_STATUS", {
+            playerKind: "GoogleCast",
+            traceEvent: "CAST_RELAY_REQUESTED"
+          });
+        }
+        break;
+      case "CAST_RELAY_REQUEST_FAILED":
+        if (activeCastRelayTransferId && data.payload?.transferId === activeCastRelayTransferId) {
+          emit("CAST_RELAY_FAILED", {
+            transferId: activeCastRelayTransferId,
+            reason: data.payload?.reason || "JW_CAST_RELAY_FAILED"
+          });
+          activeCastRelayTransferId = null;
+        }
+        break;
+      case "CAST_REQUESTED":
+        if (stickyCastRequested() && stickyCastResumeState === "api_fallback") {
+          stickyCastResumeState = "awaiting_remote";
+          emit("CAST_STATUS", {
+            playerKind: "GoogleCast",
+            stickyTransferRequested: true,
+            stickyTransferMethod: "JW_REQUEST_CAST_FALLBACK",
+            traceEvent: "JW_REQUEST_CAST_FALLBACK"
+          });
+        }
+        break;
+      case "CAST_REQUEST_FAILED":
+        fallBackFromStickyCast(data.payload?.reason || "JW_CAST_REQUEST_FAILED");
         break;
       case "ERROR":
         emit("MEDIA_ERROR", { ...status, error: data.payload?.error || data.payload?.eventData?.message || null });
@@ -285,6 +516,128 @@
   }
 
   window.addEventListener("message", handleJwBridgeMessage);
+
+  function sendCastCommand(command, payload = {}) {
+    window.postMessage({
+      channel: CAST_CHANNEL,
+      direction: "isolated-to-main",
+      command,
+      payload
+    }, "*");
+  }
+
+  function requestCastRemoteControl(payload, sendResponse) {
+    const commandId = `${Date.now()}:${++castRemoteCommandSequence}`;
+    const timeoutId = setTimeout(() => {
+      if (!pendingCastRemoteCommands.has(commandId)) return;
+      pendingCastRemoteCommands.delete(commandId);
+      sendResponse({ ok: false, reason: "CAST_REMOTE_COMMAND_TIMEOUT" });
+    }, CAST_REMOTE_COMMAND_TIMEOUT_MS);
+
+    pendingCastRemoteCommands.set(commandId, { sendResponse, timeoutId });
+    sendCastCommand("REMOTE_CONTROL", {
+      commandId,
+      action: payload?.action,
+      seconds: payload?.seconds,
+      castSessionId: payload?.castSessionId || null
+    });
+  }
+
+  function handleCastBridgeMessage(event) {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.channel !== CAST_CHANNEL || data.direction !== "main-to-isolated") return;
+
+    const payload = {
+      playerKind: "GoogleCast",
+      ...(data.payload || {})
+    };
+
+    if (data.event === "REMOTE_CONTROL_RESULT") {
+      const commandId = String(payload.commandId || "");
+      const pending = pendingCastRemoteCommands.get(commandId);
+      if (!pending) return;
+      pendingCastRemoteCommands.delete(commandId);
+      clearTimeout(pending.timeoutId);
+      pending.sendResponse({
+        ok: Boolean(payload.ok),
+        reason: payload.reason || null,
+        status: payload
+      });
+      return;
+    }
+
+    if (data.event === "REJOIN_INTERACTION_REQUIRED") {
+      emit("CAST_STATUS", payload);
+      stickyCastInteractiveRejoinReason = payload.rejoinReason || "CAST_REJOIN_INTERACTION_REQUIRED";
+      requestTrustedHtml5CastControl(stickyCastInteractiveRejoinReason);
+      return;
+    }
+
+    if ([
+      "STATUS",
+      "UNAVAILABLE",
+      "REJOIN_REQUESTED",
+      "REJOIN_FAILED",
+      "REQUEST_SESSION_CALLED",
+      "REQUEST_SESSION_RESOLVED",
+      "REQUEST_SESSION_FAILED",
+      "SESSION_STATE_CHANGED",
+      "CAST_STATE_CHANGED",
+      "CAST_CONTEXT_CONFIGURED",
+      "CAST_CONTEXT_CONFIG_FAILED",
+      "LOAD_MEDIA_CALLED",
+      "LOAD_MEDIA_SUCCEEDED",
+      "LOAD_MEDIA_FAILED"
+    ].includes(data.event)) {
+      emit("CAST_STATUS", payload);
+      const rejoined = data.event === "SESSION_STATE_CHANGED" &&
+        ["SESSION_RESUMED", "SESSION_STARTED"].includes(String(payload.sessionState || "").toUpperCase());
+      if (stickyCastRequested() && (data.event === "STATUS" || rejoined) && payload.connected && payload.sessionId === config.castSessionId) {
+        stickyCastConnected = true;
+        if (currentPlayerKind === "html5" && !config?.castRelayMode) {
+          // Rejoining the Cast session only restores sender/session ownership;
+          // unlike JW's requestCast relay it does not transfer the new HTML5
+          // episode. Trigger the provider-owned visible Cast control once so
+          // the provider remains responsible for its own media load.
+          requestTrustedHtml5CastControl("HTML5_CAST_SESSION_REJOINED");
+        } else {
+          maybeTransferStickyCast();
+        }
+      }
+      return;
+    }
+
+    if (data.event === "REMOTE_PLAYING") {
+      payload.traceEvent = payload.traceEvent || "REMOTE_PLAYING";
+      emit("CAST_STATUS", payload);
+      if (activeCastRelayTransferId) {
+        emit("CAST_RELAY_PLAYING", {
+          ...payload,
+          transferId: activeCastRelayTransferId
+        });
+        activeCastRelayTransferId = null;
+        return;
+      }
+      if (stickyCastRequested()) {
+        if (!["transferring", "awaiting_remote", "remote"].includes(stickyCastResumeState)) return;
+        stickyCastResumeState = "remote";
+        clearStickyCastResumeTimer();
+        clearJwStartup();
+        if (currentPlayerKind === "jw" && jwPlayingObserved) sendJwCommand("PAUSE");
+      }
+      emit("MEDIA_PLAYING", payload);
+      return;
+    }
+
+    if (data.event === "REMOTE_ENDED") {
+      payload.traceEvent = payload.traceEvent || "REMOTE_ENDED";
+      emit("CAST_STATUS", payload);
+      emit("MEDIA_ENDED", payload);
+    }
+  }
+
+  window.addEventListener("message", handleCastBridgeMessage);
 
   function shortcutTargetConsumesSpace(event) {
     const path = typeof event.composedPath === "function" ? event.composedPath() : [event.target];
@@ -699,6 +1052,7 @@
     startupDeadline = 0;
     startupAttempt = 0;
     startupInFlight = false;
+    startupEscalationEmitted = false;
     lastPlayError = null;
     playingObserved = false;
   }
@@ -756,7 +1110,7 @@
 
   function emitStartupBlocked(video, reason, error = null) {
     if (reason === "AUTOPLAY_BLOCKED" || reason === "PLAY_START_TIMEOUT" || reason === "USER_ACTIVATION_REQUIRED") {
-      showActivationGate(reason === "AUTOPLAY_BLOCKED" ? "Edge benötigt einen Start-Klick" : "Zum Starten einmal klicken");
+      showActivationGate(reason === "AUTOPLAY_BLOCKED" ? "Browser benötigt einen Start-Klick" : "Zum Starten einmal klicken");
     }
     emit("MEDIA_PLAY_BLOCKED", {
       reason,
@@ -808,22 +1162,31 @@
     try {
       await playWithTimeout(video);
       lastPlayError = null;
+      if (generation !== startupGeneration || video !== currentVideo || playingObserved) return;
       if (!video.paused && !video.ended) {
         // Some players do not dispatch `playing` immediately. Give the native event
         // a short opportunity; a subsequent retry verifies that playback actually stuck.
         scheduleStartupAttempt(video, generation, 350);
       } else {
+        if (!startupEscalationEmitted) {
+          startupEscalationEmitted = true;
+          emitStartupBlocked(video, "USER_ACTIVATION_REQUIRED");
+        }
         scheduleStartupAttempt(video, generation);
       }
     } catch (error) {
       lastPlayError = playAttemptError(error);
       const terminal = terminalPlayReason(error);
-      if (terminal) {
+      if (terminal && !startupEscalationEmitted) {
+        startupEscalationEmitted = true;
         emitStartupBlocked(video, terminal, lastPlayError);
-        clearStartup();
-      } else {
-        scheduleStartupAttempt(video, generation);
+      } else if (error?.name === "TimeoutError" && !startupEscalationEmitted) {
+        startupEscalationEmitted = true;
+        emitStartupBlocked(video, "PLAY_START_TIMEOUT", lastPlayError);
       }
+      // Keep the bounded startup loop alive after early escalation so a failed
+      // trusted activation still reaches the final timeout/failover path.
+      scheduleStartupAttempt(video, generation);
     } finally {
       startupInFlight = false;
     }
@@ -845,12 +1208,23 @@
     detachVideo();
     currentPlayerKind = "html5";
     currentVideo = video;
+    switchHtml5StickyCastToRejoin();
     currentVideo.setAttribute(CANONICAL_MEDIA_ATTR, "true");
     const presentation = enterPresentationMode(video);
     if (presentation.providerControls) removeControls();
     else ensureControls(video);
 
     const onPlaying = () => {
+      if (shouldDeferLocalPlayback()) {
+        // Provider HTML5 players may autostart independently of QEC. While a
+        // retained Cast session is being rejoined, do not let that transient
+        // local start become the canonical playback signal or prematurely
+        // release the retiring Cast sender.
+        try { video.pause(); } catch {}
+        playingObserved = false;
+        updateControls(video);
+        return;
+      }
       playingObserved = true;
       if (startupTimerId) clearTimeout(startupTimerId);
       startupTimerId = null;
@@ -867,7 +1241,7 @@
     const onStateChange = () => updateControls(video);
     const onReady = () => {
       updateControls(video);
-      if (!playingObserved) scheduleStartupAttempt(video, startupGeneration, 0);
+      if (!playingObserved && !shouldDeferLocalPlayback()) scheduleStartupAttempt(video, startupGeneration, 0);
     };
 
     for (const [type, handler] of [
@@ -888,7 +1262,7 @@
     }
 
     emit(replacement ? "MEDIA_REPLACED" : "MEDIA_FOUND", snapshot(video));
-    startPlaybackStartup(video);
+    if (!shouldDeferLocalPlayback()) startPlaybackStartup(video);
   }
 
   function discover(replacement = false) {
@@ -936,7 +1310,23 @@
   function startObservation(nextConfig) {
     stopObservation(false);
     config = nextConfig;
+    stickyCastConnected = false;
+    stickyCastTransferRequested = false;
+    stickyCastInteractiveRejoinReason = null;
+    castRelayItemRequested = false;
+    activeCastRelayTransferId = null;
+    stickyCastResumeState = nextConfig.castRelayMode
+      ? "relay_pending"
+      : (nextConfig.castSessionId ? "pending" : "idle");
+    if (nextConfig.castSessionId) armStickyCastResumeTimeout();
     observeDom();
+    sendCastCommand("PROBE");
+    if (nextConfig.castSessionId && !nextConfig.castRelayMode) {
+      sendCastCommand("REJOIN_SESSION", {
+        sessionId: nextConfig.castSessionId,
+        receiverApplicationId: nextConfig.castReceiverApplicationId || null
+      });
+    }
 
     if (discover(false)) return;
     ensurePreVideoActivationGate();
@@ -954,6 +1344,18 @@
     observer?.disconnect();
     observer = null;
     clearDiscoveryTimeout();
+    clearStickyCastResumeTimer();
+    stickyCastConnected = false;
+    stickyCastTransferRequested = false;
+    stickyCastInteractiveRejoinReason = null;
+    castRelayItemRequested = false;
+    activeCastRelayTransferId = null;
+    for (const pending of pendingCastRemoteCommands.values()) {
+      clearTimeout(pending.timeoutId);
+      pending.sendResponse({ ok: false, reason: "CAST_REMOTE_SURFACE_STOPPED" });
+    }
+    pendingCastRemoteCommands.clear();
+    stickyCastResumeState = "idle";
     detachVideo();
     detachJw();
     currentPlayerKind = null;
@@ -967,7 +1369,10 @@
       startObservation({
         sessionId: message.sessionId,
         epoch: message.epoch,
-        provider: message.payload?.provider || "Unknown"
+        provider: message.payload?.provider || "Unknown",
+        castSessionId: message.payload?.castSessionId || null,
+        castReceiverApplicationId: message.payload?.castReceiverApplicationId || null,
+        castRelayMode: Boolean(message.payload?.castRelayMode)
       });
       sendResponse({ ok: true });
       return true;
@@ -975,6 +1380,131 @@
 
     if (message.type === "PROVIDER_STOP") {
       stopObservation(true);
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message.type === "POPUP_CAST_REMOTE_CONTROL") {
+      if (!config || message.sessionId !== config.sessionId || message.epoch !== config.epoch) {
+        sendResponse({ ok: false, reason: "CAST_REMOTE_SESSION_MISMATCH" });
+        return true;
+      }
+      requestCastRemoteControl(message.payload || {}, sendResponse);
+      return true;
+    }
+
+    if (message.type === "CAST_HANDOFF_RESULT") {
+      const handoffMethod = String(message.payload?.handoffMethod || "");
+
+      if (handoffMethod === "TRUSTED_HTML5_CAST_CONTROL") {
+        if (!stickyCastRequested() || stickyCastResumeState !== "html5_native_trigger") {
+          sendResponse({ ok: true, ignored: true });
+          return true;
+        }
+
+        if (message.payload?.ok) {
+          stickyCastResumeState = "awaiting_remote";
+          emit("CAST_STATUS", {
+            playerKind: "GoogleCast",
+            stickyTransferRequested: true,
+            stickyTransferMethod: "TRUSTED_HTML5_CAST_CONTROL",
+            traceEvent: "TRUSTED_HTML5_CAST_CONTROL"
+          });
+        } else {
+          // Not every HTML5 player exposes a semantic Cast control. Preserve
+          // the existing Google-owned CastContext UI request as the bounded
+          // fallback rather than guessing provider-specific DOM behavior.
+          emit("CAST_STATUS", {
+            playerKind: "GoogleCast",
+            traceEvent: `HTML5_CAST_CONTROL_FAILED:${message.payload?.reason || "UNKNOWN"}`
+          });
+          stickyCastResumeState = "pending";
+          requestTrustedHtml5CastContext(message.payload?.reason || "HTML5_CAST_CONTROL_NOT_FOUND");
+        }
+        sendResponse({ ok: true });
+        return true;
+      }
+
+      if (handoffMethod === "TRUSTED_CAST_CONTEXT_REQUEST") {
+        if (!stickyCastRequested() || stickyCastResumeState !== "context_trigger") {
+          sendResponse({ ok: true, ignored: true });
+          return true;
+        }
+
+        if (message.payload?.ok) {
+          stickyCastResumeState = "awaiting_remote";
+          emit("CAST_STATUS", {
+            playerKind: "GoogleCast",
+            stickyTransferRequested: true,
+            stickyTransferMethod: "TRUSTED_CAST_CONTEXT_REQUEST",
+            traceEvent: "TRUSTED_CAST_CONTEXT_REQUEST"
+          });
+        } else {
+          fallBackFromStickyCast(message.payload?.reason || "CAST_CONTEXT_REQUEST_FAILED");
+        }
+        sendResponse({ ok: true });
+        return true;
+      }
+
+      if (!stickyCastRequested() || stickyCastResumeState !== "native_trigger") {
+        sendResponse({ ok: true, ignored: true });
+        return true;
+      }
+
+      if (message.payload?.ok) {
+        stickyCastResumeState = "awaiting_remote";
+        emit("CAST_STATUS", {
+          playerKind: "GoogleCast",
+          stickyTransferRequested: true,
+          stickyTransferMethod: "TRUSTED_JW_CAST_CONTROL",
+          traceEvent: "TRUSTED_JW_CAST_CONTROL"
+        });
+      } else {
+        // If the provider's native cast control is not present, keep the
+        // public JW API as a bounded fallback. The trusted control is preferred
+        // because it follows the exact player-owned path used by the viewer.
+        stickyCastResumeState = "api_fallback";
+        sendJwCommand("CAST_CURRENT");
+      }
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message.type === "CAST_RELAY_APPLY") {
+      const transferId = String(message.payload?.transferId || "").trim();
+      const item = message.payload?.item;
+      if (!transferId || !item || typeof item !== "object" || currentPlayerKind !== "jw") {
+        sendResponse({ ok: false, reason: "CAST_RELAY_APPLY_INVALID" });
+        return true;
+      }
+      activeCastRelayTransferId = transferId;
+      sendJwCommand("CAST_RELAY_ITEM", { transferId, item });
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message.type === "CAST_RELAY_FAILED") {
+      if (config?.castRelayMode) fallBackFromStickyCast(message.payload?.reason || "CAST_RELAY_FAILED");
+      sendResponse({ ok: true });
+      return true;
+    }
+
+    if (message.type === "CAST_RELAY_PROMOTE") {
+      config = {
+        ...(config || {}),
+        sessionId: message.sessionId,
+        epoch: message.epoch,
+        provider: message.payload?.provider || config?.provider || "Unknown",
+        castSessionId: message.payload?.castSessionId || config?.castSessionId || null,
+        castReceiverApplicationId: message.payload?.castReceiverApplicationId || config?.castReceiverApplicationId || null,
+        castRelayMode: false
+      };
+      stickyCastConnected = true;
+      stickyCastResumeState = "remote";
+      castRelayItemRequested = false;
+      activeCastRelayTransferId = null;
+      clearStickyCastResumeTimer();
+      clearJwStartup();
       sendResponse({ ok: true });
       return true;
     }

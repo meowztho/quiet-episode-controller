@@ -85,7 +85,8 @@
       ["playAttemptFailed", "PLAY_FAILED"],
       ["autostartNotAllowed", "AUTOSTART_NOT_ALLOWED"],
       ["resize", "RESIZE"],
-      ["fullscreen", "FULLSCREEN"]
+      ["fullscreen", "FULLSCREEN"],
+      ["cast", "CAST"]
     ];
 
     for (const [jwEvent, qecEvent] of events) {
@@ -156,6 +157,96 @@
         case "SET_MUTE":
           player.setMute(Boolean(payload.muted));
           break;
+        case "EXPORT_CAST_ITEM": {
+          if (typeof player.getPlaylistItem !== "function") {
+            post("CAST_ITEM_EXPORT_FAILED", {
+              ...snapshot(player),
+              reason: "JW_PLAYLIST_ITEM_UNAVAILABLE"
+            });
+            break;
+          }
+          const item = player.getPlaylistItem();
+          if (!item || typeof item !== "object") {
+            post("CAST_ITEM_EXPORT_FAILED", {
+              ...snapshot(player),
+              reason: "JW_PLAYLIST_ITEM_UNAVAILABLE"
+            });
+            break;
+          }
+          // User-approved Cast continuity exception: relay the provider-owned JW
+          // playlist item opaquely to the retained sender. Do not inspect or log
+          // media fields here; the object exists only for the one handoff.
+          post("CAST_ITEM_EXPORT", { item });
+          break;
+        }
+        case "CAST_RELAY_ITEM": {
+          const transferId = String(payload.transferId || "").trim();
+          const item = payload.item;
+          if (!transferId || !item || typeof item !== "object" || typeof player.requestCast !== "function") {
+            post("CAST_RELAY_REQUEST_FAILED", {
+              ...snapshot(player),
+              transferId: transferId || null,
+              reason: "JW_CAST_RELAY_UNAVAILABLE"
+            });
+            break;
+          }
+          try {
+            const result = player.requestCast([item]);
+            post("CAST_RELAY_REQUESTED", { ...snapshot(player), transferId });
+            if (result && typeof result.then === "function") {
+              result.catch((error) => {
+                post("CAST_RELAY_REQUEST_FAILED", {
+                  ...snapshot(player),
+                  transferId,
+                  reason: "JW_CAST_RELAY_REJECTED",
+                  error: String(error?.message || error || "JW relay requestCast failed")
+                });
+              });
+            }
+          } catch (error) {
+            post("CAST_RELAY_REQUEST_FAILED", {
+              ...snapshot(player),
+              transferId,
+              reason: "JW_CAST_RELAY_FAILED",
+              error: String(error?.message || error || "JW relay requestCast failed")
+            });
+          }
+          break;
+        }
+        case "CAST_CURRENT": {
+          if (typeof player.requestCast !== "function" || typeof player.getPlaylistItem !== "function") {
+            post("CAST_REQUEST_FAILED", {
+              ...snapshot(player),
+              reason: "JW_CAST_API_UNAVAILABLE"
+            });
+            break;
+          }
+
+          const item = player.getPlaylistItem();
+          if (!item || typeof item !== "object") {
+            post("CAST_REQUEST_FAILED", {
+              ...snapshot(player),
+              reason: "JW_PLAYLIST_ITEM_UNAVAILABLE"
+            });
+            break;
+          }
+
+          // Keep media details entirely inside the provider-owned JW bridge.
+          // QEC neither serializes nor stores the playlist item / source URL;
+          // JW's own cast implementation receives its current item directly.
+          const result = player.requestCast([item]);
+          post("CAST_REQUESTED", snapshot(player));
+          if (result && typeof result.catch === "function") {
+            result.catch((error) => {
+              post("CAST_REQUEST_FAILED", {
+                ...snapshot(player),
+                reason: "JW_CAST_REQUEST_REJECTED",
+                error: String(error?.message || error || "JW requestCast failed")
+              });
+            });
+          }
+          break;
+        }
         default:
           break;
       }

@@ -4,14 +4,18 @@ import {
   acceptMessage,
   beginEpisode,
   createSession,
+  isSessionActive,
+  markPlaybackSurfaceLost,
   markProviderAttached,
+  recordCastStatus,
   recordMedia,
   recordProviderFailure,
+  retirePlaybackSurface,
   selectProvider,
   setPlaybackTab,
   stop
 } from "../../src/core/session.js";
-import { SessionState } from "../../src/core/protocol.js";
+import { PlaybackAuthority, SessionLifecycle, SessionState } from "../../src/core/protocol.js";
 
 function runningSession() {
   let session = createSession({ sessionId: "s1", tabId: 10, windowId: 20, fullscreen: true });
@@ -129,4 +133,188 @@ test("provider attempts and failures are scoped to one episode", () => {
   });
   assert.deepEqual(session.attemptedProviders, []);
   assert.deepEqual(session.providerFailures, []);
+});
+
+
+test("cast session becomes sticky and survives episode advancement", () => {
+  let session = createSession({ sessionId: "s1", tabId: 10, windowId: 20 });
+  session = beginEpisode(session, {
+    supported: true,
+    episodeIdentity: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 1, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-1" },
+    nextEpisode: null,
+    diagnostics: []
+  });
+
+  session = recordCastStatus(session, {
+    available: true,
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Wohnzimmer TV",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  });
+
+  assert.equal(session.cast.sticky, true);
+  assert.equal(session.cast.connected, true);
+  assert.equal(session.cast.sessionId, "cast-123");
+  assert.equal(session.cast.deviceName, "Wohnzimmer TV");
+
+  session = beginEpisode(session, {
+    supported: true,
+    episodeIdentity: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 2, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-2" },
+    nextEpisode: null,
+    diagnostics: []
+  });
+
+  assert.equal(session.cast.sticky, true);
+  assert.equal(session.cast.sessionId, "cast-123");
+  assert.equal(session.cast.deviceName, "Wohnzimmer TV");
+});
+
+
+test("JW Cast diagnostics cannot create or clear framework-owned connection state", () => {
+  let session = createSession({ sessionId: "s1", tabId: 10, windowId: 20 });
+  session = recordCastStatus(session, {
+    jwCastActive: true,
+    jwCastAvailable: true,
+    jwCastDeviceName: "Seb",
+    traceEvent: "JW_CAST_ACTIVE"
+  });
+  assert.equal(session.cast.connected, false);
+  assert.equal(session.cast.sticky, false);
+  assert.equal(session.cast.sessionId, null);
+
+  session = recordCastStatus(session, {
+    available: true,
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    traceEvent: "SESSION:SESSION_STARTED"
+  });
+  assert.equal(session.cast.connected, true);
+  assert.equal(session.cast.sessionId, "cast-123");
+
+  session = recordCastStatus(session, {
+    jwCastActive: false,
+    traceEvent: "JW_CAST_INACTIVE"
+  });
+  assert.equal(session.cast.connected, true, "diagnostic-only JW state must not clear framework connection state");
+  assert.equal(session.cast.sessionId, "cast-123");
+  assert.equal(session.cast.jwCastActive, false);
+});
+
+
+test("global session lifecycle stays active independently of episode phase", () => {
+  let session = createSession({ sessionId: "s1", tabId: 10, windowId: 20 });
+  assert.equal(session.lifecycle, SessionLifecycle.ACTIVE);
+  assert.equal(isSessionActive(session), true);
+  assert.equal(session.playbackAuthority, PlaybackAuthority.NONE);
+
+  session = beginEpisode(session, {
+    supported: true,
+    episodeIdentity: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 1, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-1" },
+    nextEpisode: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 2, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-2" },
+    diagnostics: []
+  });
+  session = setPlaybackTab(session, 30);
+  session = recordMedia(session, "MEDIA_PLAYING", { playerKind: "JWPlayer" }).session;
+  assert.equal(session.state, SessionState.RUNNING);
+  assert.equal(session.lifecycle, SessionLifecycle.ACTIVE);
+  assert.equal(session.playbackAuthority, PlaybackAuthority.LOCAL);
+
+  const ended = recordMedia(session, "MEDIA_ENDED", { playerKind: "JWPlayer" });
+  assert.equal(ended.session.state, SessionState.NAVIGATING);
+  assert.equal(ended.session.lifecycle, SessionLifecycle.ACTIVE);
+  assert.equal(ended.session.playbackAuthority, PlaybackAuthority.NONE);
+});
+
+test("unexpected playback-surface loss blocks but does not end the global session", () => {
+  let session = runningSession();
+  session = recordCastStatus(session, {
+    available: true,
+    connected: true,
+    sessionId: "cast-123",
+    mediaPlayerState: "PLAYING"
+  });
+  assert.equal(session.playbackAuthority, PlaybackAuthority.CAST);
+
+  session = markPlaybackSurfaceLost(session);
+  assert.equal(session.lifecycle, SessionLifecycle.ACTIVE);
+  assert.equal(isSessionActive(session), true);
+  assert.equal(session.state, SessionState.BLOCKED);
+  assert.equal(session.blockedReason, "PLAYBACK_SURFACE_CLOSED");
+  assert.equal(session.playbackTabId, null);
+  assert.equal(session.playbackAuthority, PlaybackAuthority.CAST);
+});
+
+test("remote Cast authority ignores unrelated local JW playback failures until Cast becomes idle", () => {
+  let session = runningSession();
+  session = recordCastStatus(session, {
+    connected: true,
+    sessionId: "cast-123",
+    mediaPlayerState: "PLAYING"
+  });
+  assert.equal(session.playbackAuthority, PlaybackAuthority.CAST);
+
+  session = recordMedia(session, "MEDIA_PLAYING", { playerKind: "JWPlayer" }).session;
+  assert.equal(session.playbackAuthority, PlaybackAuthority.CAST);
+  assert.equal(session.state, SessionState.RUNNING);
+
+  session = recordMedia(session, "MEDIA_ERROR", { playerKind: "JWPlayer", error: "local sender error" }).session;
+  assert.equal(session.playbackAuthority, PlaybackAuthority.CAST);
+  assert.equal(session.state, SessionState.RUNNING);
+  assert.equal(session.blockedReason, null);
+
+  session = recordCastStatus(session, {
+    connected: true,
+    sessionId: "cast-123",
+    mediaPlayerState: "IDLE"
+  });
+  assert.equal(session.playbackAuthority, PlaybackAuthority.NONE);
+});
+
+test("local helper playback cannot steal authority while a retained Cast sender is pending", () => {
+  let session = runningSession();
+  session = recordCastStatus(session, {
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  });
+  session = retirePlaybackSurface(session);
+  session = beginEpisode(session, {
+    supported: true,
+    episodeIdentity: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 2, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-2" },
+    nextEpisode: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" },
+    diagnostics: []
+  });
+  session = setPlaybackTab(session, 31);
+
+  const local = recordMedia(session, "MEDIA_PLAYING", { playerKind: "HTML5", paused: false }).session;
+  assert.equal(local.lifecycle, SessionLifecycle.ACTIVE);
+  assert.equal(local.state, SessionState.ARMING);
+  assert.equal(local.playbackAuthority, PlaybackAuthority.NONE);
+  assert.equal(local.retiringPlaybackTabId, 30);
+  assert.equal(local.lastMedia.payload.playerKind, "HTML5");
+
+  const remote = recordMedia(local, "MEDIA_PLAYING", { playerKind: "GoogleCast", mediaPlayerState: "PLAYING" }).session;
+  assert.equal(remote.state, SessionState.RUNNING);
+  assert.equal(remote.playbackAuthority, PlaybackAuthority.CAST);
+});
+
+test("stop and natural completion end the global lifecycle", () => {
+  let stopped = runningSession();
+  stopped = stop(stopped);
+  assert.equal(stopped.lifecycle, SessionLifecycle.ENDED);
+  assert.equal(isSessionActive(stopped), false);
+  assert.equal(stopped.playbackAuthority, PlaybackAuthority.NONE);
+
+  let completed = runningSession();
+  completed = { ...completed, nextEpisode: null };
+  completed = recordMedia(completed, "MEDIA_ENDED", { playerKind: "JWPlayer" }).session;
+  assert.equal(completed.state, SessionState.COMPLETED);
+  assert.equal(completed.lifecycle, SessionLifecycle.ENDED);
+  assert.equal(isSessionActive(completed), false);
 });

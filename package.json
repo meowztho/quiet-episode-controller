@@ -1,6 +1,6 @@
 {
   "name": "quiet-episode-controller",
-  "version": "0.4.3",
+  "version": "0.5.13",
   "private": true,
   "type": "module",
   "scripts": {

@@ -73,27 +73,83 @@ For generic HTML5, the Provider Agent first checks whether the canonical video a
 ### Playback startup
 Recognized player APIs are attempted before generic `HTMLMediaElement.play()`. HTML5 attempt #1 is issued immediately so background-tab timer throttling cannot consume the startup window before any real attempt. Startup remains bounded and can retry transient initialization failures. Player/API events are normalized to the same canonical media events. `AUTOPLAY_BLOCKED` or `PLAY_START_TIMEOUT` admits at most one automatic targeted activation attempt per episode through the constrained `gesture-activation.js` transport: JW receives one CDP Space rawKeyDown/keyUp pair; HTML5 receives one `Runtime.evaluate(userGesture:true)` call to `.play()` only the Provider Agent-marked canonical video. Both attach only to the canonical playback tab and detach immediately. If that still does not produce `MEDIA_PLAYING`, the session remains BLOCKED. Provider attach or `MEDIA_FOUND` does **not** imply successful playback.
 
-## Session Core
 
-```text
-IDLE -> ARMING -> RUNNING -> NAVIGATING -> ARMING -> RUNNING ... -> COMPLETED
-                    │
-                    └-> BLOCKED
-Any active state -> STOPPED
+### Provider-owned Google Cast continuity
+
+When the provider page already loads the Google Cast Web Sender SDK, the Provider Frame Agent may use a MAIN-world Cast bridge to observe the provider-created Cast session. The first device selection is performed through the provider's own Cast UI.
+
+The bridge emits normalized Cast status only:
+
+```js
+{
+  available,
+  connected,
+  sessionId,
+  deviceName,
+  receiverApplicationId,
+  mediaPlayerState,
+  mediaIdleReason,
+  remoteControlAvailable,
+  isMediaLoaded,
+  remoteCurrentTime,
+  remoteDuration
+}
 ```
 
 Rules:
-- provider attach keeps the session in `ARMING`; only `MEDIA_PLAYING` makes it `RUNNING`;
-- controller tab remains the episode-source identity;
+- a connected session becomes sticky for the current QEC session;
+- `beginEpisode` preserves that sticky Cast metadata;
+- a new provider tab may receive the saved `sessionId` and retained `receiverApplicationId`; legacy bounded rejoin/Native-Control behavior remains a compatibility/fallback path, not the primary same-provider JW continuity mechanism;
+- on natural Cast `MEDIA_ENDED`, the old provider tab becomes a retiring real sender and remains alive while the controller advances and one next-episode helper tab opens;
+- when the retiring sender and next selected provider are the same JW-based provider, the helper exports exactly its current provider-owned JW playlist item and emits it once through `CAST_RELAY_ITEM`; Session Core routes the opaque object transiently to the retained sender through `CAST_RELAY_APPLY` and persists only an ephemeral transfer token/state;
+- the retained JW sender passes that same object directly to its existing `jwplayer().requestCast([item])`; QEC must not inspect or persist its media fields;
+- remote `PLAYING` from the retained sender normalizes to canonical `MEDIA_PLAYING`, promotes that retained sender back to the canonical playback surface for the new epoch, and closes the helper tab; bounded relay failure falls back to ordinary local playback;
+- when the same-provider helper resolves to generic HTML5, the JW-only relay is not used: Provider Agent switches to the retained-session rejoin path, defers local HTML5 startup/autoplay, and waits for a matching Cast reconnect plus real remote `PLAYING`;
+- retained HTML5 rejoin attempts the documented silent `chrome.cast.requestSessionById(sessionId)` path first; only a current session whose id exactly equals the retained id counts as rejoined;
+- after a matching retained HTML5 session is available, Provider Agent requests one trusted activation of a visible semantic Cast control inside the canonical HTML5 player surface so provider code owns transfer/loading of the new episode;
+- if no semantic HTML5 Cast control is available and the silent by-id path is unavailable/exhausted, Cast bridge emits one interaction-required signal and the existing trusted-activation transport may invoke only the bridge's fixed `CastContext.requestSession()` entry point with `userGesture:true`, causing Google's own Cast session UI to open;
+- that trusted framework request is allowed only for an already-retained sticky session; QEC does not select a receiver, inspect/export HTML5 media, or construct/load Cast media, and remote `PLAYING` remains the only success signal;
+- during that HTML5 continuation window, local helper `MEDIA_PLAYING` cannot become canonical playback authority and cannot release the retiring sender; remote `PLAYING` closes the retiring sender, while bounded `stickyResumeFailed` releases it and permits ordinary local HTML5 fallback;
+- remote Cast `IDLE` with idle reason `FINISHED` normalizes to canonical `MEDIA_ENDED`;
+- no Cast `contentId`/media URL is read or persisted into extension state;
+- QEC never constructs its own Cast `MediaInfo`/`LoadRequest`, never invokes media loading with QEC-owned media data, never creates its own Cast receiver, and never scans/selects devices itself; diagnostic wrapping of provider-owned framework and legacy Cast `loadMedia` may record only call/result metadata, API path, autoplay and title-metadata presence and never serialize media arguments/identifiers;
+- provider-native JW `requestCast()` is permitted only inside the JW MAIN-world bridge with the current provider-owned playlist object passed directly through, without stream reconstruction or extension-state exposure.
+- while Cast is the canonical playback authority, the popup may issue only `TOGGLE_PLAY_PAUSE`, `SEEK_RELATIVE`, `SEEK_TO`, and `STOP`; Background routes them to the canonical playback tab, Provider Agent transports them to the existing Cast bridge, and the bridge rejects a mismatched Cast session id before calling `RemotePlayerController`;
+- Cast progress/seek UI uses `RemotePlayer.currentTime`/`duration` and media-loaded state only; local JW/HTML5 playback never becomes a mirror state source for remote controls;
+- explicit QEC Stop may best-effort invoke remote `STOP` before the QEC lifecycle ends and the sender tab closes.
+
+Provider/receiver incompatibility is non-fatal: local playback remains the fallback and rejoin/handoff attempts are bounded per playback tab.
+
+## Session Core
+
+The Session Core owns three orthogonal values instead of treating one enum as all session truth:
+
+```text
+Global lifecycle:   NONE (no stored session) -> ACTIVE -> ENDED
+Episode phase:      ARMING -> RUNNING -> NAVIGATING -> ARMING ...
+                              └-> BLOCKED
+Terminal labels:    STOPPED | COMPLETED
+Playback authority: NONE | LOCAL_PLAYER | CAST
+```
+
+`ACTIVE` is the browser-wide single-session lock and the popup Start/Stop authority. Episode phase and playback authority may change many times without ending that lock.
+
+Rules:
+- provider attach keeps the episode phase in `ARMING`; only `MEDIA_PLAYING` makes it `RUNNING`;
+- controller tab remains the episode-source identity; closing it ends the global lifecycle;
+- one `ACTIVE` QEC session is allowed browser-wide; opening the popup from another tab observes that same session and cannot create a second one;
+- unexpected loss of the canonical playback tab clears that surface and enters `BLOCKED / PLAYBACK_SURFACE_CLOSED`, but the lifecycle remains `ACTIVE`; explicit Stop remains available;
 - media messages are accepted only from the current playback tab + current session/epoch + frame 0;
 - one `MEDIA_ENDED` yields at most one transition token;
 - on next episode: clear playback identity -> close playback tab -> navigate controller -> re-probe after load;
-- no-next: close playback tab -> COMPLETED;
+- no-next: close playback tab -> `COMPLETED` and lifecycle `ENDED`;
+- explicit Stop -> `STOPPED` and lifecycle `ENDED`;
 - stale old-tab/old-epoch messages are ignored;
 - Auto mode keeps a per-episode `attemptedProviders`/`providerFailures` ledger and selects only the next untried candidate in configured priority order;
 - provider setup failure, `PLAYER_NOT_FOUND`, `USER_ACTIVATION_REQUIRED`, `MEDIA_ERROR`, or `AUTOPLAY_BLOCKED`/`PLAY_START_TIMEOUT` after the single trusted recovery closes the failed playback tab and re-probes the same controller episode before selecting the next candidate;
 - each provider is attempted at most once per episode; exhaustion becomes `NO_WORKING_PROVIDER`;
-- manual provider selection disables runtime failover and remains on the explicitly chosen provider.
+- manual provider selection disables runtime failover and remains on the explicitly chosen provider;
+- a provider-created Cast session, once observed as connected, is retained as session-scoped metadata across episode epochs and offered to the next Provider Agent for bounded rejoin.
 
 ## Permission Broker
 

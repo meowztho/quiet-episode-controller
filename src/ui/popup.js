@@ -1,4 +1,4 @@
-import { envelope, MessageType, SessionState } from "../core/protocol.js";
+import { CastRemoteAction, envelope, MessageType, PlaybackAuthority, SessionLifecycle, SessionState } from "../core/protocol.js";
 import { permissionPatternForOrigin } from "../permissions/permission-broker.js";
 import { DEFAULT_PROVIDER_PRIORITY } from "../providers/registry.js";
 
@@ -10,10 +10,28 @@ const els = {
   start: document.querySelector("#start"),
   stop: document.querySelector("#stop"),
   grant: document.querySelector("#grant"),
+  castControls: document.querySelector("#cast-controls"),
+  castBack: document.querySelector("#cast-back"),
+  castToggle: document.querySelector("#cast-toggle"),
+  castForward: document.querySelector("#cast-forward"),
+  castSeek: document.querySelector("#cast-seek"),
+  castCurrent: document.querySelector("#cast-current"),
+  castDuration: document.querySelector("#cast-duration"),
   error: document.querySelector("#error")
 };
 
 let lastStatus = null;
+let castSeekInProgress = false;
+
+function formatTime(value) {
+  const seconds = Math.max(0, Math.floor(Number(value) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remainder = seconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+    : `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
 
 function providerSelection() {
   if (els.provider.value === "voe") {
@@ -40,6 +58,32 @@ function render(status) {
     lines.push(`Fallback: ${failed}`);
   }
   if (status?.playbackDocument?.origin) lines.push(`Player: ${status.playbackDocument.origin}`);
+  if (status?.lifecycle === SessionLifecycle.ACTIVE) {
+    const authority = status?.playbackAuthority;
+    if (authority === PlaybackAuthority.CAST) lines.push("Wiedergabe: Chromecast");
+    else if (authority === PlaybackAuthority.LOCAL) lines.push("Wiedergabe: Webplayer");
+    else lines.push("Wiedergabe: Übergang / noch nicht gestartet");
+  }
+  if (status?.cast?.connected) {
+    const device = status.cast.deviceName || "Cast-Gerät";
+    lines.push(`Cast: ${device} · wird für diese Session beibehalten`);
+    if (status.cast.stickyTransferMethod) lines.push(`Cast-Handoff: ${status.cast.stickyTransferMethod}`);
+    if (status.cast.remoteControlDriver) lines.push(`Cast-Steuerung: ${status.cast.remoteControlDriver}`);
+    if (typeof status.cast.jwCastActive === "boolean") {
+      lines.push(`JW Cast: ${status.cast.jwCastActive ? "aktiv" : "inaktiv"}`);
+    }
+    if (Array.isArray(status.cast.trace) && status.cast.trace.length) {
+      lines.push(`Cast-Trace: ${status.cast.trace.slice(-10).join(" → ")}`);
+    }
+  } else if (status?.cast?.sticky && status?.cast?.sessionId) {
+    const device = status.cast.deviceName || "Cast-Gerät";
+    lines.push(`Cast: ${device} · Wiederverbinden…`);
+    if (Array.isArray(status.cast.trace) && status.cast.trace.length) {
+      lines.push(`Cast-Trace: ${status.cast.trace.slice(-10).join(" → ")}`);
+    }
+  } else if (status?.cast?.available) {
+    lines.push("Cast: verfügbar · Gerät einmal im Player auswählen");
+  }
   if (status?.blockedReason) lines.push(`Status: ${status.blockedReason}`);
   if (status?.lastMedia?.type) {
     const media = status.lastMedia.payload || {};
@@ -57,12 +101,38 @@ function render(status) {
   if (status?.pendingPermissionOrigin) lines.push(`Benötigt Zugriff: ${status.pendingPermissionOrigin}`);
   els.details.textContent = lines.join("\n");
 
-  const active = ![SessionState.IDLE, SessionState.STOPPED, SessionState.COMPLETED].includes(state);
+  const active = status?.lifecycle === SessionLifecycle.ACTIVE;
   els.start.disabled = active;
   els.provider.disabled = active;
   els.fullscreen.disabled = active;
   els.stop.disabled = !active;
   els.grant.hidden = status?.blockedReason !== "PROVIDER_PERMISSION_REQUIRED" || !status?.pendingPermissionOrigin;
+
+  const castState = String(status?.cast?.mediaPlayerState || "").toUpperCase();
+  const castControlActive = Boolean(
+    active &&
+    status?.playbackAuthority === PlaybackAuthority.CAST &&
+    status?.cast?.connected &&
+    status?.cast?.remoteControlAvailable
+  );
+  els.castControls.hidden = !castControlActive;
+  if (castControlActive) {
+    const current = Number.isFinite(status.cast.remoteCurrentTime) ? status.cast.remoteCurrentTime : 0;
+    const duration = Number.isFinite(status.cast.remoteDuration) && status.cast.remoteDuration > 0
+      ? status.cast.remoteDuration
+      : 0;
+    const canSeek = duration > 0 && status.cast.isMediaLoaded !== false;
+    els.castToggle.textContent = castState === "PLAYING" || castState === "BUFFERING" ? "Pause" : "Fortsetzen";
+    els.castBack.disabled = !canSeek;
+    els.castForward.disabled = !canSeek;
+    els.castSeek.disabled = !canSeek;
+    els.castSeek.max = String(Math.max(1, Math.floor(duration)));
+    if (!castSeekInProgress) els.castSeek.value = String(Math.min(current, Math.max(1, duration)));
+    els.castCurrent.textContent = formatTime(castSeekInProgress ? Number(els.castSeek.value) : current);
+    els.castDuration.textContent = formatTime(duration);
+  } else {
+    castSeekInProgress = false;
+  }
 }
 
 async function send(type, payload = {}) {
@@ -106,6 +176,31 @@ els.stop.addEventListener("click", async () => {
   } catch (error) {
     els.error.textContent = String(error?.message || error);
   }
+});
+
+async function castControl(action, seconds = null) {
+  try {
+    els.error.textContent = "";
+    await send(MessageType.CAST_REMOTE_CONTROL, {
+      action,
+      ...(Number.isFinite(seconds) ? { seconds } : {})
+    });
+  } catch (error) {
+    els.error.textContent = String(error?.message || error);
+  }
+}
+
+els.castToggle.addEventListener("click", () => castControl(CastRemoteAction.TOGGLE_PLAY_PAUSE));
+els.castBack.addEventListener("click", () => castControl(CastRemoteAction.SEEK_RELATIVE, -10));
+els.castForward.addEventListener("click", () => castControl(CastRemoteAction.SEEK_RELATIVE, 10));
+els.castSeek.addEventListener("input", () => {
+  castSeekInProgress = true;
+  els.castCurrent.textContent = formatTime(Number(els.castSeek.value));
+});
+els.castSeek.addEventListener("change", async () => {
+  const seconds = Number(els.castSeek.value);
+  castSeekInProgress = false;
+  if (Number.isFinite(seconds)) await castControl(CastRemoteAction.SEEK_TO, seconds);
 });
 
 els.grant.addEventListener("click", async () => {

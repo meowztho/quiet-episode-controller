@@ -12,6 +12,20 @@
     <div id="state" class="state">Lade…</div>
     <div id="details" class="details"></div>
 
+    <section id="cast-controls" class="cast-controls" hidden aria-label="Chromecast-Steuerung">
+      <div class="cast-controls__title">Chromecast</div>
+      <div class="cast-controls__transport">
+        <button id="cast-back" type="button" class="secondary" title="10 Sekunden zurück">−10 s</button>
+        <button id="cast-toggle" type="button">Pause</button>
+        <button id="cast-forward" type="button" class="secondary" title="10 Sekunden vor">+10 s</button>
+      </div>
+      <input id="cast-seek" class="cast-controls__seek" type="range" min="0" max="100" step="1" value="0" aria-label="Chromecast-Wiedergabeposition">
+      <div class="cast-controls__time">
+        <span id="cast-current">0:00</span>
+        <span id="cast-duration">0:00</span>
+      </div>
+    </section>
+
     <label class="row">
       <span>Hoster</span>
       <select id="provider">

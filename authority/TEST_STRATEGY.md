@@ -7,8 +7,10 @@ Evidence must match the owner boundary. Fixture success never proves current liv
 ## 1. Session/Core tests
 Cover:
 - Start/Stop;
-- exactly one controller session;
+- exactly one browser-wide `ACTIVE` controller session, including concurrent Start attempts from different tabs;
+- global lifecycle independently from episode phase and playback authority;
 - playback-tab identity;
+- unexpected canonical playback-tab closure blocks but does not silently end/release the session;
 - duplicate `MEDIA_ENDED`;
 - stale session/epoch/playback-tab rejection;
 - no-next completion;
@@ -60,3 +62,8 @@ For each provider family record:
 - foreground/focus interference observations.
 
 M5/M6 cannot be completed by fixtures alone.
+
+
+## Experimental Google Cast continuity
+
+Deterministic fixture coverage must prove that a natural remote Cast end keeps the old sender tab alive as a retiring playback surface while preserving the retained session ID/device metadata, that the saved session ID plus receiver application ID are passed to the next provider page, that the new page initializes its existing `CastContext` with the retained app ID/`ORIGIN_SCOPED`/`resumeSavedSession` before `requestSessionById`, and that rejoin reconnects the session. The rejoined JW player must follow the provider-owned native Cast-control path while suppressing local startup; provider-owned media load must be observable on both Framework and legacy Cast API shapes without request/media identifiers escaping into QEC state; remote PLAYING maps to `MEDIA_PLAYING`, remote FINISHED maps to `MEDIA_ENDED`, and the retiring sender closes only after new canonical playback succeeds. Generic HTML5 fixtures must additionally prove that if `requestSessionById` is unavailable/exhausted, the bridge emits one interaction requirement, only the fixed trusted Cast-session request is admitted with `userGesture:true`, Google/Provider remains media owner, and local HTML5 still cannot become canonical before remote success or bounded fallback. Static checks must reject direct Cast page-API access outside the MAIN-world Cast bridge, reject arbitrary debugger Runtime.evaluate use, reject `contentId`/`MediaInfo` extraction/construction, and reject QEC-owned Cast media loading. Real Chromecast/Google Cast continuity remains `live_browser` evidence and cannot be inferred from fixtures.

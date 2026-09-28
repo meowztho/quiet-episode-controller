@@ -337,7 +337,7 @@
     {
       "id": "A-016",
       "stage": "M4",
-      "criterion": "Repository/product code contains no OS mouse/keyboard or coordinate automation path",
+      "criterion": "Repository/product code contains no OS mouse/keyboard or arbitrary coordinate automation path; the only pointer-input exception is one semantic JW Cast-control click in the canonical playback tab",
       "required_evidence_class": "static",
       "status": "VERIFIED",
       "evidence": [
@@ -364,6 +364,14 @@
           "command": "python scripts/static_check.py && python tests/browser/run_provider_fixture_tests.py",
           "result": "PASS",
           "notes": "v0.3.1 still forbids OS input/focus/coordinates and arbitrary CDP input. The only admitted browser-input path is one fixed Space rawKeyDown/keyUp pair to the canonical playback tab. Provider fixture verifies the targeted background document receives it as isTrusted with transient user activation while another page remains foreground."
+        },
+        {
+          "class": "static",
+          "revision": "6a640bd",
+          "date": "2026-09-28",
+          "command": "npm run check",
+          "result": "PASS",
+          "notes": "v0.5.3 keeps chrome.debugger owned only by gesture-activation.js. Static policy admits exactly three bounded transports: JW Space, canonical HTML5 userGesture play, and one move/press/release sequence after resolving the semantic .jw-icon-cast control. OS pointer movement, arbitrary coordinates/targets, other keys, focus forcing, and Network/DOM/Fetch/Storage debugger use remain rejected."
         }
       ]
     },
@@ -430,6 +438,14 @@
           "command": "npm run check",
           "result": "PASS",
           "notes": "Both privileged recovery transports remain one-attempt-per-episode and playback-tab scoped: JW uses only targeted Space; HTML5 uses one userGesture:true evaluation on the Provider Agent-marked canonical media. Static gate forbids arbitrary keys, mouse input, Network/DOM/Fetch/Storage inspection, focus forcing and OS input."
+        },
+        {
+          "class": "test",
+          "revision": "6a640bd",
+          "date": "2026-09-28",
+          "command": "npm run check",
+          "result": "PASS",
+          "notes": "Retained Cast native-control handoff is one-shot and bounded by the existing resume timeout; if the semantic cast control is unavailable the previous JW API is only a bounded fallback, then local playback resumes rather than escalating to general input automation."
         }
       ]
     },
@@ -495,8 +511,17 @@
       "stage": "M5",
       "criterion": "Current live VOE-family integration is exercised successfully or documented as blocked with current evidence",
       "required_evidence_class": "live_browser",
-      "status": "UNVERIFIED",
-      "evidence": []
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "live_browser",
+          "revision": "v0.5.7",
+          "date": "2026-09-28",
+          "command": "User live Chrome/Edge VOE/Google Cast retained-sender relay test",
+          "result": "VERIFIED / TWO CONSECUTIVE AUTOMATIC CAST ROLLOVERS",
+          "notes": "User observed Episode 8 finish and Episode 9 start correctly on the already-selected Chromecast, then Episode 9 finish and Episode 10 also start correctly on Chromecast without reporting another device picker. The local web/JW player no longer behaved as the controlling surface after relay; that control-authority/state issue is separated into v0.5.8 rather than treated as a Cast continuity failure."
+        }
+      ]
     },
     {
       "id": "A-M5-002",
@@ -529,7 +554,16 @@
       "criterion": "Multi-episode run shows no duplicate transitions, runaway retries, orphan/duplicate playback tabs, extra windows, or focus-stealing fallback",
       "required_evidence_class": "live_browser",
       "status": "UNVERIFIED",
-      "evidence": []
+      "evidence": [
+        {
+          "class": "live_browser",
+          "revision": "v0.5.7",
+          "date": "2026-09-28",
+          "command": "User live multi-episode Cast rollover observation",
+          "result": "PARTIAL / TWO SUCCESSIVE EPISODE TRANSITIONS",
+          "notes": "Episode 8 -> 9 and 9 -> 10 both advanced and played on Chromecast. This supports transition deduplication/continuity but does not by itself prove the full M6 criterion for orphan tabs, extra windows, retries, and focus behavior, so A-M6-001 remains UNVERIFIED."
+        }
+      ]
     },
     {
       "id": "A-M5-003",
@@ -571,7 +605,180 @@
       "criterion": "Current live Auto mode falls back from a terminally failing VOE/Doodstream provider to the next offered provider without user intervention, duplicate attempts, or focus stealing",
       "required_evidence_class": "live_browser",
       "status": "UNVERIFIED",
-      "evidence": []
+      "evidence": [
+        {
+          "class": "automated_fixture",
+          "status": "PASS",
+          "revision": "07fb87f",
+          "date": "2026-09-28",
+          "command": "npm run check",
+          "result": "PASS (35 unit/orchestration tests + CastContext bootstrap + dual load-path provider fixture + static/package/project gates)",
+          "notes": "Fixture requires CastContext.setOptions(retained receiver app id, ORIGIN_SCOPED, resumeSavedSession=true) before requestSessionById can connect, then proves native JW handoff, provider-owned framework+legacy loadMedia tracing and remote PLAYING without media URL/contentId escaping extension state."
+        }
+      ]
+    },
+    {
+      "id": "A-024",
+      "stage": "M3",
+      "criterion": "A provider-created Google Cast session can persist across episode epochs; for same-provider JW continuity, the next provider-owned JW playlist item is relayed only transiently to the retained real Cast sender, which becomes canonical again only after remote PLAYING",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "035147a",
+          "date": "2026-09-28",
+          "command": "npm run check",
+          "result": "PASS (33 unit/orchestration tests + provider Cast fixture + static/package/project gates)",
+          "notes": "Session schema v5 retains Cast metadata; next provider attach receives castSessionId; fixture proves requestSessionById rejoin plus remote PLAYING/FINISHED normalization. Static gate confines Cast page API access to cast-main-bridge.js and forbids loadMedia/contentId/media URL extraction."
+        },
+        {
+          "class": "test",
+          "revision": "cf22576",
+          "date": "2026-09-28",
+          "command": "npm run check",
+          "result": "PASS (33 unit/orchestration tests + event-driven Cast-end fixture + Chrome early-escalation fixture + static/package/project gates)",
+          "notes": "Regression models a provider that unloads getMediaSession() immediately at natural Cast completion; RemotePlayerController event state plus preserved near-end position still emits canonical MEDIA_ENDED. A JW fixture that silently ignores ordinary play must request trusted escalation within 5 seconds rather than waiting for the 12-second terminal bound."
+        },
+        {
+          "class": "test",
+          "revision": "105d7b8",
+          "date": "2026-09-28",
+          "command": "npm run check",
+          "result": "PASS (33 unit/orchestration tests + JW Cast media-handoff fixture + Cast end + Chrome startup + static/package/project gates)",
+          "notes": "Fixture models an empty rejoined Cast session on the next VOE/JW episode. Provider Agent suppresses local JW play, JW bridge passes getPlaylistItem() directly to requestCast(), remote PLAYING becomes canonical GoogleCast playback, and the synthetic source URL is proven absent from QEC runtime messages. loadMedia/contentId remain forbidden."
+        },
+        {
+          "class": "automated_fixture",
+          "status": "PASS",
+          "revision": "WORKTREE-v0.5.5",
+          "notes": "Fixture proves SESSION_RESUMED -> trusted native JW Cast control -> provider-owned CastSession.loadMedia call/success trace -> remote PLAYING. QEC never serializes the LoadRequest/contentId; old sender overlap is owned by Session Core and closes only after the new playback surface reaches MEDIA_PLAYING."
+        },
+        {
+          "class": "automated_fixture",
+          "status": "PASS",
+          "revision": "60e0f0f",
+          "date": "2026-09-28",
+          "command": "npm test && python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS (37/37 unit/orchestration tests + CAST_OPAQUE_JW_RELAY browser fixture)",
+          "notes": "Orchestration keeps old Cast sender tab 30, opens helper tab 31, relays one synthetic provider-owned JW item only through CAST_RELAY_ITEM/APPLY, proves its synthetic media URL never enters session storage, observes retained sender CAST_RELAY_PLAYING, promotes tab 30 to the new epoch and closes helper tab 31. Browser fixture exercises MAIN-world export -> extension relay -> retained jwplayer().requestCast([item]) -> remote PLAYING and proves media URL is absent from status/diagnostic messages."
+        }
+      ]
+    },
+    {
+      "id": "A-M5-005",
+      "stage": "M5",
+      "criterion": "On a real Google Cast device, one provider-native device selection is adopted by QEC and the next episode rejoins the same Cast session without another device picker, while remote episode completion advances the controller exactly once",
+      "required_evidence_class": "live_browser",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "live_browser",
+          "revision": "93a5f33",
+          "date": "2026-09-28",
+          "command": "User live VOE/Google Cast test",
+          "result": "PARTIAL / FAIL AT REMOTE END",
+          "notes": "QEC recognized Cast device Seb and remained RUNNING with MEDIA_PLAYING · player=GoogleCast, but did not detect natural receiver completion. This falsified polling-only end detection and motivated v0.5.1 cf22576; real-device retest is required."
+        },
+        {
+          "class": "live_browser",
+          "revision": "7b48714",
+          "date": "2026-09-28",
+          "command": "User live Chrome VOE/Google Cast retest",
+          "result": "PARTIAL / CAST END + NEXT EPISODE PASS; NEXT MEDIA HANDOFF FAIL",
+          "notes": "Chrome startup improved to about 1 second. Cast device Seb remained adopted, natural remote completion advanced from S1E2 to S1E3 and opened the next VOE player, but S1E3 played locally as JWPlayer (try=5) while the sticky Cast session still showed Seb. This proves requestSessionById alone does not load the new episode and motivates v0.5.2 provider-native JW requestCast handoff."
+        },
+        {
+          "class": "live_browser",
+          "revision": "61f172d",
+          "date": "2026-09-28",
+          "command": "User live Chrome VOE/Google Cast v0.5.3 retest",
+          "result": "PARTIAL / OLD CAST SESSION RETAINED; REJOIN STUCK; LOCAL FALLBACK",
+          "notes": "After remote completion advanced to S1E4, QEC showed Cast: Seb · Wiederverbinden… while the new VOE/JW episode played locally (JWPlayer state=playing, try=5). This disproves retained-session rejoin + native Cast-control trigger as sufficient while the previous sender is not explicitly released."
+        },
+        {
+          "class": "test",
+          "revision": "32b3269",
+          "date": "2026-09-28",
+          "command": "npm test && python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS",
+          "notes": "v0.5.4 fixture proves natural remote end calls CastContext.endCurrentSession(false) exactly once, reports receiverKeptRunning=true, preserves retained session metadata semantics, and keeps the bounded rejoin/native-control path for the next provider page. Real Chromecast retest remains required."
+        },
+        {
+          "class": "live_browser",
+          "status": "FAIL",
+          "revision": "v0.5.4",
+          "notes": "Real Chrome/VOE/Chromecast test: endCurrentSession(false) ended the receiver path and the next episode did not reconnect. v0.5.5 supersedes this with sender overlap plus metadata-free Cast lifecycle/loadMedia tracing; real-device retest required."
+        },
+        {
+          "class": "live_browser",
+          "status": "FAIL",
+          "revision": "v0.5.5",
+          "date": "2026-09-28",
+          "command": "User live Chrome VOE/Google Cast v0.5.5 retest",
+          "result": "PARTIAL / JW CAST ACTIVE WITHOUT USABLE REJOIN OR MEDIA LOAD",
+          "notes": "Automatic S1E7 rollover showed Cast: Seb · Wiederverbinden…, Cast-Trace JW_CAST_ACTIVE, and local JWPlayer playback. Receiver displayed 'Default media'. Manual provider Cast then produced REJOIN_REQUESTED attempts -> SESSION_STARTED -> JW_CAST_ACTIVE, canonical GoogleCast playback, and the episode title on the receiver. This motivates v0.5.6 CastContext initialization before rejoin plus early dual framework/legacy loadMedia tracing."
+        },
+        {
+          "class": "live_browser",
+          "revision": "v0.5.7",
+          "date": "2026-09-28",
+          "command": "User live Chrome/Edge VOE/Google Cast retained-sender relay test",
+          "result": "VERIFIED / TWO CONSECUTIVE AUTOMATIC CAST ROLLOVERS",
+          "notes": "User observed Episode 8 finish and Episode 9 start correctly on the already-selected Chromecast, then Episode 9 finish and Episode 10 also start correctly on Chromecast without reporting another device picker. The local web/JW player no longer behaved as the controlling surface after relay; that control-authority/state issue is separated into v0.5.8 rather than treated as a Cast continuity failure."
+        }
+      ]
+    },
+    {
+      "id": "A-025",
+      "stage": "M3",
+      "criterion": "Browser-wide QEC session ownership is independent of episode phase/playback authority: one ACTIVE session disables additional Start, unexpected playback-tab loss stays ACTIVE/BLOCKED, and only explicit Stop or natural completion ends the lifecycle",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "v0.5.8",
+          "date": "2026-09-28",
+          "command": "npm run check",
+          "result": "PASS (43/43 unit/orchestration tests + DOM/provider fixtures + static/package/project gates)",
+          "notes": "Covers concurrent cross-tab Start serialization, lifecycle/phase/authority separation, unexpected playback-surface-loss preservation, Stop/natural-completion lifecycle, and the existing v0.5.7 retained-sender relay regression."
+        }
+      ]
+    },
+    {
+      "id": "A-026",
+      "stage": "M3",
+      "criterion": "During same-provider retained Cast continuation with a generic HTML5 helper, local helper playback cannot become canonical or close the retiring sender before Cast rejoin resolves; real remote PLAYING closes the old sender and bounded rejoin failure releases it for local fallback.",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "v0.5.9",
+          "date": "2026-09-28",
+          "command": "npm test && python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS (45/45 unit/orchestration tests + HTML5_STICKY_CAST_REJOIN provider fixture)",
+          "notes": "Session Core ignores local HTML5 authority while a sticky retiring Cast sender is pending. Background keeps the old sender until remote GoogleCast playback or stickyResumeFailed. Provider Agent switches the JW-only relay request to retained-session rejoin for HTML5, defers/autopauses local playback, and accepts matching reconnect -> REMOTE_PLAYING as success without exporting media."
+        }
+      ]
+    },
+    {
+      "id": "A-027",
+      "stage": "M3",
+      "criterion": "When retained HTML5 Cast continuation cannot use the silent requestSessionById path, QEC requests at most one trusted Google-owned Cast session UI activation through the fixed Cast bridge entry point; QEC does not select a receiver or load media, and remote PLAYING remains the only handoff success signal.",
+      "required_evidence_class": "test",
+      "status": "VERIFIED",
+      "evidence": [
+        {
+          "class": "test",
+          "revision": "v0.5.10",
+          "date": "2026-09-28",
+          "command": "node --test tests/unit/gesture-activation.test.js tests/unit/background-orchestration.test.js && python tests/browser/run_provider_fixture_tests.py && python scripts/static_check.py",
+          "result": "PASS",
+          "notes": "Unit/orchestration proves the HTML5 handoff requests only the fixed trusted Cast bridge session-request function with userGesture and returns the method through the canonical handoff result. Provider fixture proves missing requestSessionById emits REJOIN_INTERACTION_REQUIRED and the bridge fixed entry point calls CastContext.requestSession exactly once. Static gate keeps page-level Cast API ownership in cast-main-bridge.js and forbids arbitrary Runtime.evaluate/media loading."
+        }
+      ]
     }
   ],
   "evidence_rules": {
@@ -589,5 +796,189 @@
   "v0_4_3_serienstream_mirrors": {
     "status": "IMPLEMENTED_LOCAL_VERIFIED_LIVE_PENDING",
     "notes": "s.to and serienstream.cx are mirror host profiles of the same SerienStream adapter; current S.to-style data-play-url provider extraction is locally verified across all admitted mirror surfaces."
+  },
+  "v0_5_0_cast_continuity": {
+    "status": "LIVE_PARTIAL_REMOTE_END_FAILED",
+    "notes": "Real VOE Cast test recognized device/session and remote playing, but natural remote completion was missed."
+  },
+  "v0_5_1_cast_chrome_hardening": {
+    "status": "LIVE_PARTIAL_CAST_END_AND_CHROME_START_PASS_NEXT_CAST_MEDIA_FAILED",
+    "notes": "Real Chrome startup improved to ~1 second and remote Cast completion advanced to the next episode, but the next VOE/JW episode played locally despite the retained Cast session."
+  },
+  "v0_5_2_cast_media_handoff": {
+    "status": "IMPLEMENTED_LOCAL_VERIFIED_LIVE_PENDING",
+    "notes": "After rejoin, local JW startup is suppressed and the current provider-owned JW playlist item is passed directly to native JW requestCast(); remote PLAYING confirms handoff. No media URL is persisted or emitted by QEC."
+  },
+  "v0_5_3_native_cast_control": {
+    "status": "LIVE_PARTIAL_REJOIN_STUCK_LOCAL_FALLBACK",
+    "notes": "The next VOE episode remained at Cast: Seb · Wiederverbinden… and started locally, showing that the old sender must be explicitly released before rejoin."
+  },
+  "v0_5_4_cast_sender_release": {
+    "status": "IMPLEMENTED_LOCAL_VERIFIED_LIVE_PENDING",
+    "notes": "At natural remote end the old sender calls endCurrentSession(false), leaving the receiver app running; the next provider page then reuses the retained session ID and existing native JW Cast handoff path."
+  },
+  "v0_5_5_cast_sender_overlap": {
+    "status": "LIVE_PARTIAL_CONTEXT_NOT_INITIALIZED_REJOIN_FAILED",
+    "notes": "Old sender overlap preserved the receiver surface, but the new VOE page emitted JW_CAST_ACTIVE without a usable resumed Cast session/media load. Manual Cast created SESSION_STARTED and transferred the titled episode."
+  },
+  "v0_5_6_cast_context_bootstrap": {
+    "status": "IMPLEMENTED_LOCAL_VERIFIED_LIVE_PENDING",
+    "notes": "Next provider page receives retained receiver app id and initializes CastContext before bounded rejoin; both provider-owned framework and legacy loadMedia paths are traced without media identifiers leaving page context."
+  },
+  "v0_5_7_retained_sender_jw_relay": {
+    "date": "2026-09-28",
+    "status": "LIVE_PASS_TWO_CONSECUTIVE_ROLLOVERS",
+    "user_decision": "Allow one opaque transient same-provider JW playlist-item relay to the retained real Cast sender; no persistence/logging/inspection and no QEC-owned Cast media load.",
+    "preceding_live_failure": {
+      "version": "v0.5.6",
+      "observed": "Cast: Seb · Wiederverbinden…; Cast-Trace JW_CAST_ACTIVE -> CAST_CONTEXT_CONFIGURED; local JWPlayer state=playing try=4; receiver remained on Default media.",
+      "interpretation": "JW player-level cast.active is not a usable session/media proof. Automatic path produced neither SESSION_STARTED/SESSION_RESUMED nor observed provider media load; manual Cast still creates the real receiver media path."
+    },
+    "local_evidence": [
+      "37/37 unit/orchestration tests pass.",
+      "CAST_OPAQUE_JW_RELAY browser fixture passes across MAIN-world and extension runtime.",
+      "Synthetic relay media URL is absent from chrome.storage.session model and all non-relay status/diagnostic messages.",
+      "JW_CAST_ACTIVE cannot create or clear framework-owned Cast connection/session truth.",
+      "QEC constructs no MediaInfo/LoadRequest and calls no loadMedia()."
+    ],
+    "live_evidence": {
+      "date": "2026-09-28",
+      "result": "Episode 8 -> 9 and Episode 9 -> 10 both continued on the already-selected Chromecast.",
+      "remaining_issue": "After relay the local JW/web player is no longer a reliable control/status authority; v0.5.8 separates global lifecycle and playback authority before remote-control UI work."
+    }
+  },
+  "v0_5_8_global_session_authority": {
+    "date": "2026-09-28",
+    "status": "LOCAL_PASS_LIVE_UI_PENDING",
+    "architecture": "Session Core remains the sole owner; lifecycle ACTIVE/ENDED, episode state, and playbackAuthority NONE/LOCAL_PLAYER/CAST are orthogonal. Popup Start/Stop derives only from lifecycle.",
+    "local_evidence": [
+      "43/43 unit/orchestration tests pass.",
+      "DOM and provider browser-fixture suites pass, including CAST_OPAQUE_JW_RELAY.",
+      "Static ownership/non-interference check, extension package validation, and Project Gate pass.",
+      "Concurrent Start from different tabs creates only one playback surface and rejects the second session.",
+      "Unexpected canonical playback-tab closure becomes BLOCKED/PLAYBACK_SURFACE_CLOSED while lifecycle remains ACTIVE."
+    ],
+    "live_limit": "Start/Stop button behavior from an unrelated tab and the v0.5.9 Doodstream correction still need live Edge/Chrome observation.",
+    "browser_attempt": {
+      "command": "npm run test:browser",
+      "result": "INCONCLUSIVE",
+      "reason": "Chromium in the current sandbox did not load the unpacked extension, so the production popup/runtime interaction was not exercised."
+    },
+    "live_evidence": {
+      "date": "2026-09-28",
+      "result": "VOE rollover remained successful and popup reported Chromecast authority; Doodstream exposed an HTML5 retiring-sender race.",
+      "voe_observed": "After automatic rollover, popup showed RUNNING, Wiedergabe: Chromecast, Cast: Seb retained, TRUSTED_JW_CAST_CONTROL, CAST_RELAY_REMOTE_PLAYING, and MEDIA_PLAYING player=GoogleCast.",
+      "doodstream_observed": "After Doodstream episode rollover the old sender tab closed immediately; the next helper ran locally as HTML5 while Cast remained Seb · Wiederverbinden…, with provider-owned LOAD_MEDIA_CALLED:legacy -> LOAD_MEDIA_SUCCEEDED:framework trace.",
+      "interpretation": "v0.5.8 global authority did not regress the proven VOE/JW relay. Doodstream fails earlier because helper-local HTML5 MEDIA_PLAYING released the retiring sender before retained Cast rejoin could settle."
+    }
+  },
+  "v0_5_9_html5_retained_cast_handoff": {
+    "date": "2026-09-28",
+    "status": "LIVE_PARTIAL_OVERLAP_PASS_SILENT_REJOIN_UNAVAILABLE",
+    "architecture": "Session Core remains the single authority. D-028 remains JW-only. Generic HTML5 continuation reuses the existing retained-session rejoin capability and Provider Agent; no media extraction, QEC-owned Cast load, or provider-specific session manager is added.",
+    "root_cause": "Any helper MEDIA_PLAYING was treated as local fallback and immediately closed retiringPlaybackTabId. Doodstream HTML5 can emit local playing before Cast rejoin settles, unlike the deferred VOE/JW relay path.",
+    "local_evidence": [
+      "45/45 unit/orchestration tests pass.",
+      "Provider browser fixture passes HTML5_STICKY_CAST_REJOIN: castRelayMode on an HTML5 helper becomes retained-session REJOIN_SESSION, QEC does not call local play, provider autoplay is paused/ignored, and matching reconnect + REMOTE_PLAYING becomes GoogleCast playback.",
+      "Regression proves local helper MEDIA_PLAYING cannot steal authority or close the retiring sender; stickyResumeFailed closes it only after the bounded continuation attempt fails.",
+      "The existing CAST_OPAQUE_JW_RELAY fixture remains passing and unchanged in semantics."
+    ],
+    "live_limit": "Real Doodstream/playmogo Chromecast episode rollover must be repeated. Expected trace now includes HTML5_CAST_REJOIN and the old sender must remain open until remote PLAYING or bounded fallback.",
+    "live_evidence": {
+      "date": "2026-09-28",
+      "result": "Retiring-sender preservation no longer failed immediately, but Doodstream rollover still stayed local.",
+      "observed": "S1E7 Doodstream/playmogo popup: Wiedergabe Webplayer; Cast Seb retained; Cast-Trace LOAD_MEDIA_CALLED:legacy -> LOAD_MEDIA_SUCCEEDED:framework -> HTML5_CAST_REJOIN -> CAST_CONTEXT_CONFIGURED; MEDIA_PLAYING player=HTML5. No REJOIN_REQUESTED and no Cast popup appeared.",
+      "interpretation": "D-030 fixed premature retiring-sender release. The remaining failure is earlier in the Cast transport: current playmogo exposes enough Framework API for setOptions but no usable silent requestSessionById call was observed."
+    }
+  },
+  "v0_5_10_html5_cast_session_ui_fallback": {
+    "date": "2026-09-28",
+    "status": "LIVE_FAIL_NO_INTERACTION_AFTER_CONTEXT_CONFIG",
+    "architecture": "No new session/Cast owner. Cast MAIN-world bridge remains sole Cast API owner; gesture-activation only transports transient user activation to the fixed bridge requestSession entry point on the canonical playback tab.",
+    "root_cause": "Live v0.5.9 reached CAST_CONTEXT_CONFIGURED but no REJOIN_REQUESTED, showing the current Doodstream/playmogo sender surface did not provide a usable silent requestSessionById path.",
+    "local_evidence": [
+      "Full local gate passes: 47/47 unit/orchestration tests, DOM fixtures, provider fixtures, static checks, extension-package validation, and Project Gate.",
+      "Provider fixture proves requestSessionById-unavailable -> REJOIN_INTERACTION_REQUIRED -> fixed CastContext.requestSession fallback; HTML5 local playback remains deferred both while the trusted Google Cast UI activation is being requested and while remote PLAYING is awaited.",
+      "Static gate preserves Cast API ownership and no-QEC-media-load constraints; QEC still does not select a receiver, construct Cast media, or call loadMedia()."
+    ],
+    "browser_attempt": {
+      "command": "npm run test:browser",
+      "result": "INCONCLUSIVE",
+      "notes": "Chromium in the sandbox did not load the unpacked extension, so the production extension runtime and Google Cast picker were not exercised."
+    },
+    "live_limit": "Real Doodstream/playmogo rollover must confirm the Google Cast popup now opens and that provider/Google behavior reaches remote PLAYING on Seb without QEC selecting a device or loading media.",
+    "live_evidence": {
+      "date": "2026-09-28",
+      "observed": "S1E10 Doodstream/playmogo remained Wiedergabe Webplayer; Cast Seb Wiederverbinden…; Cast-Trace LOAD_MEDIA_CALLED:legacy -> LOAD_MEDIA_SUCCEEDED:framework -> HTML5_CAST_REJOIN -> CAST_CONTEXT_CONFIGURED; MEDIA_PLAYING player=HTML5. No Cast dialog and no remote handoff appeared.",
+      "interpretation": "The v0.5.10 fallback never reached an interaction signal on this live surface. Session recovery and provider-owned media transfer were still conflated; CastContext configuration alone is insufficient."
+    }
+  },
+  "v0_5_11_html5_provider_cast_control": {
+    "date": "2026-09-28",
+    "status": "LOCAL_PASS_LIVE_DOODSTREAM_PENDING",
+    "architecture": "No new session/Cast owner. Cast MAIN-world bridge still owns Cast API/session observation; Provider Agent owns handoff sequencing; gesture-activation only transports one bounded semantic HTML5 Cast-control click or the existing fixed requestSession fallback.",
+    "root_cause": "v0.5.10 stopped after CAST_CONTEXT_CONFIGURED because any current CastContext session suppressed by-id rejoin and, even after a correct session recovery, HTML5 had no provider-owned media-transfer trigger analogous to VOE/JW.",
+    "local_evidence": [
+      "49/49 unit/orchestration tests pass.",
+      "DOM and provider browser-fixture suites pass. Provider fixture covers retained-session reconnect -> TRUSTED_HTML5_CAST_CONTROL, control-missing -> TRUSTED_CAST_CONTEXT_REQUEST fallback, and foreign current Cast session -> requestSessionById(retained id).",
+      "Static ownership/non-interference policy, extension package validation, and Project Gate pass.",
+      "The HTML5 pointer activation is constrained to the already-marked canonical player surface and semantic Cast controls; no QEC media extraction/load path is introduced."
+    ],
+    "live_limit": "Real Doodstream/playmogo rollover must show whether its current player exposes a semantic Cast control and whether that provider-owned activation transfers the next episode to Seb. Remote PLAYING remains required for success.",
+    "browser_attempt": {
+      "command": "npm run test:browser",
+      "result": "INCONCLUSIVE",
+      "notes": "Chromium in the sandbox did not load the unpacked extension, so the production extension runtime and real Cast control/UI were not exercised."
+    }
+  },
+  "v0_5_12_cast_remote_controls": {
+    "date": "2026-09-28",
+    "status": "LIVE_FAIL_CONTROLS_HIDDEN_REMOTEPLAYER_UNAVAILABLE",
+    "architecture": "Cast MAIN-world bridge remains the single page-level Cast API/control owner. Popup and Background route a bounded semantic command contract to the canonical playback tab; Session Core remains the sole lifecycle/playback-authority owner.",
+    "user_scope": "Doodstream/playmogo retained-Cast rollover is explicitly deferred. VOE remains the live-proven Cast continuity path and is the observable boundary for v0.5.12 remote controls.",
+    "local_evidence": [
+      "50/50 unit/orchestration tests pass.",
+      "DOM fixture suite passes.",
+      "Provider fixture suite passes with RemotePlayerController Play/Pause, relative seek, absolute seek, Stop, session-id validation path, and the existing Cast completion/relay regressions.",
+      "Focused real Chromium fixture independently exercised TOGGLE_PLAY_PAUSE, SEEK_RELATIVE, SEEK_TO, and STOP through Provider Agent -> Cast MAIN-world bridge and observed the expected RemotePlayerController calls/state changes.",
+      "Static ownership/non-interference check and extension package validation pass.",
+      "Popup controls are gated by ACTIVE lifecycle + CAST playbackAuthority + connected Cast + remoteControlAvailable; progress derives from remote currentTime/duration rather than JW/HTML5 local media."
+    ],
+    "live_limit": "Real VOE/Chromecast test must verify popup visibility/state and actual receiver response for Play/Pause, seek, progress, and QEC Stop. Browser-wide active-session button state also remains live-pending.",
+    "doodstream_deferred": "Further automatic Cast-rollover work on playmogo.com is deferred by user decision after the v0.5.11 live trace again stopped at CAST_CONTEXT_CONFIGURED.",
+    "browser_attempt": {
+      "command": "npm run test:browser",
+      "result": "INCONCLUSIVE",
+      "notes": "Chromium in the sandbox did not load the unpacked extension, so the production popup/runtime interaction was not exercised. This is not treated as a pass."
+    },
+    "live_evidence": {
+      "date": "2026-09-28",
+      "observed": "VOE S1E13 showed RUNNING, Wiedergabe: Chromecast, Cast: Seb retained, JW Cast active and GoogleCast MEDIA_PLAYING, but the popup rendered no Chromecast control strip.",
+      "interpretation": "The packaged popup controls existed, but D-033 gated visibility on remoteControlAvailable from Framework RemotePlayerController only. The live VOE/JW sender surface did not expose that controller path to QEC."
+    }
+  },
+  "v0_5_13_cast_remote_driver_fallback": {
+    "date": "2026-09-28",
+    "status": "LIVE_PASS_VOE",
+    "architecture": "No new Cast/session owner. cast-main-bridge.js keeps the semantic remote-control contract, preferring Framework RemotePlayerController and falling back to the active chrome.cast.media.Media control surface.",
+    "local_evidence": [
+      "50/50 unit/orchestration tests pass.",
+      "DOM fixture suite passes.",
+      "Provider browser fixture adds CAST_REMOTE_LEGACY_MEDIA_FALLBACK: with a connected Cast media session and no RemotePlayer/RemotePlayerController, the bridge reports remoteControlAvailable=true, driver=LEGACY_MEDIA, Cast-derived currentTime/duration, and executes Pause plus relative Seek successfully.",
+      "The existing Framework RemotePlayerController control fixture remains passing, so the preferred driver path is preserved.",
+      "Static ownership/non-interference check, extension package validation, and Project Gate pass.",
+      "No QEC Cast media extraction/load path is introduced; commands still revalidate the active Cast session id."
+    ],
+    "doodstream_deferred": "Doodstream/playmogo automatic Cast rollover remains explicitly deferred.",
+    "browser_attempt": {
+      "command": "npm run test:browser",
+      "result": "INCONCLUSIVE",
+      "notes": "Sandbox Chromium did not load the unpacked extension; this remained INCONCLUSIVE and was superseded for the VOE remote-control claim by the real Edge + Chromecast user test on 2026-09-28."
+    },
+    "live_evidence": [
+      "User live Edge/Chromecast test on 2026-09-28 confirmed the v0.5.13 popup Cast controls work on VOE with Chromecast device Seb.",
+      "The controls remained available and functional after the automatic next-episode rollover, proving that the selected Cast-control driver survives the proven retained-sender episode transition.",
+      "The observed result closes the v0.5.13 VOE remote-control visibility/control defect from v0.5.12; Doodstream retained-Cast rollover remains deferred and is not claimed as verified."
+    ]
   }
 }

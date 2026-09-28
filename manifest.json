@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Quiet Episode Controller",
-  "version": "0.4.3",
+  "version": "0.5.13",
   "description": "Hands-off episode progression without OS mouse or keyboard automation.",
   "permissions": [
     "activeTab",

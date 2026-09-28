@@ -144,6 +144,17 @@
         "A-023",
         "A-M5-004"
       ]
+    },
+    {
+      "id": "PR-12",
+      "name": "Optional provider-owned Google Cast continuity",
+      "required": false,
+      "owner": "Session Core + Provider Frame Agent",
+      "stage": "M3",
+      "acceptance": [
+        "A-024",
+        "A-M5-005"
+      ]
     }
   ],
   "responsibilities": [
@@ -182,6 +193,14 @@
     {
       "name": "Per-episode provider failover and attempt ledger",
       "owner": "Session Core"
+    },
+    {
+      "name": "Session-scoped Google Cast continuity metadata",
+      "owner": "Session Core"
+    },
+    {
+      "name": "Provider Cast Web Sender observation/context-bootstrap/rejoin",
+      "owner": "Provider Frame Agent"
     }
   ]
 }

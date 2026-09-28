@@ -4,6 +4,12 @@ main { padding: 14px; display: grid; gap: 12px; }
 h1 { font-size: 16px; margin: 0; }
 .state { font-weight: 700; }
 .details { font-size: 12px; opacity: .8; min-height: 28px; white-space: pre-wrap; }
+.cast-controls { display: grid; gap: 7px; padding: 10px; border: 1px solid color-mix(in srgb, currentColor 24%, transparent); border-radius: 8px; }
+.cast-controls[hidden] { display: none; }
+.cast-controls__title { font-size: 12px; font-weight: 700; }
+.cast-controls__transport { display: grid; grid-template-columns: 1fr 1.3fr 1fr; gap: 6px; }
+.cast-controls__seek { width: 100%; margin: 0; }
+.cast-controls__time { display: flex; justify-content: space-between; font-size: 11px; opacity: .75; font-variant-numeric: tabular-nums; }
 .row { display: grid; grid-template-columns: 80px 1fr; align-items: center; gap: 8px; }
 .check { display: flex; gap: 8px; align-items: flex-start; font-size: 12px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
