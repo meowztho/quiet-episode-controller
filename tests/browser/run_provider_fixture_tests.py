@@ -50,6 +50,9 @@ HTMLMediaElement.prototype.play = function () {
             kinds = page.evaluate("window.__qecMessages.map(m => m.type)")
             assert "MEDIA_FOUND" in kinds
             assert "MEDIA_PLAYING" in kinds
+            # Never persist provider media source strings in Session Core.
+            assert page.evaluate("""() => window.__qecMessages.filter(m =>
+              m.type.startsWith('MEDIA_')).every(m => !('currentSrc' in m.payload))""") is True
             presentation = page.locator("video").evaluate("v => ({controls:v.controls, position:getComputedStyle(v).position, width:getComputedStyle(v).width, height:getComputedStyle(v).height, z:getComputedStyle(v).zIndex})")
             assert presentation["controls"] is False
             assert presentation["position"] == "fixed"
@@ -352,6 +355,9 @@ window.__jwPlayer = {
 };
 window.jwplayer = function () { return window.__jwPlayer; };
 """)
+            # Cold first-episode startup with both production bridges injected
+            # but without any retained Cast session: JW must autoplay locally.
+            jw.add_script_tag(content=cast_bridge)
             jw.add_script_tag(content=jw_bridge)
             jw.add_script_tag(content=agent)
             jw.evaluate("""
@@ -363,6 +369,7 @@ window.jwplayer = function () { return window.__jwPlayer; };
             jw.wait_for_function("window.__qecMessages.some(m => m.type === 'MEDIA_PLAYING' && m.payload.playerKind === 'JWPlayer')")
             assert jw.evaluate("window.__html5PlayCalls") == 0
             assert jw.evaluate("window.__jwCalls.includes('play')") is True
+            assert jw.evaluate("window.__qecMessages.some(m => m.type === 'CAST_HANDOFF_REQUIRED')") is False
             jw.wait_for_function("window.__jwCalls.some(call => Array.isArray(call) && call[0] === 'resize' && call[1] === '100%' && call[2] > 0)")
             assert jw.evaluate("window.__jwCalls.some(call => Array.isArray(call) && call[0] === 'controls' && call[1] === true)") is True
             assert jw.evaluate("window.__jwCalls.some(call => Array.isArray(call) && call[0] === 'allowFullscreen' && call[1] === true)") is True
@@ -370,6 +377,23 @@ window.jwplayer = function () { return window.__jwPlayer; };
             assert jw_presentation["position"] == "fixed"
             assert jw.locator(".jw-controlbar").is_visible()
             assert jw.locator("#__qec_controls_root__").count() == 0
+
+            # Regression: jw STATUS -> frame-agent -> PRESENT_VIEWPORT ->
+            # jw STATUS used to generate an unbounded postMessage loop in VOE.
+            # PROBE and PAUSE must not repeatedly resize the player; a real
+            # viewport resize and JW READY must still update presentation.
+            jw.wait_for_timeout(200)
+            viewport_count = jw.evaluate("window.__jwCalls.filter(c => Array.isArray(c) && c[0] === 'resize').length")
+            assert viewport_count <= 4, f"Repeated JW viewport sync on attach: {viewport_count}"
+            jw.evaluate("window.postMessage({channel:'__QEC_JW_BRIDGE_V1__',direction:'isolated-to-main',command:'PROBE',payload:{}}, '*')")
+            jw.wait_for_timeout(120)
+            assert jw.evaluate("window.__jwCalls.filter(c => Array.isArray(c) && c[0] === 'resize').length") == viewport_count, "JW STATUS triggered a new viewport command"
+            jw.evaluate("(window.__jwHandlers.get('ready') || []).forEach(fn => fn({}))")
+            jw.wait_for_function("count => window.__jwCalls.filter(c => Array.isArray(c) && c[0] === 'resize').length === count + 1", arg=viewport_count)
+            jw.evaluate("window.dispatchEvent(new Event('resize'))")
+            jw.wait_for_function("count => window.__jwCalls.filter(c => Array.isArray(c) && c[0] === 'resize').length === count + 2", arg=viewport_count)
+            jw.wait_for_timeout(150)
+            assert jw.evaluate("window.__jwCalls.filter(c => Array.isArray(c) && c[0] === 'resize').length") == viewport_count + 2, "JW viewport messages are feeding back"
 
             # Provider wrappers may swallow Space before JW receives it. The QEC
             # driver preserves the real key event and maps only this missing
@@ -382,6 +406,35 @@ window.jwplayer = function () { return window.__jwPlayer; };
 
             jw.evaluate("(window.__jwHandlers.get('complete') || []).forEach(fn => fn({}))")
             jw.wait_for_function("window.__qecMessages.some(m => m.type === 'MEDIA_ENDED' && m.payload.playerKind === 'JWPlayer')")
+
+            # JW events can contain opaque provider objects, large payloads,
+            # or non-cloneable values. Only the small diagnostic fields needed
+            # by QEC may cross the MAIN/isolated boundary.
+            jw.evaluate("""() => {
+              window.__jwRawEvents = [];
+              window.addEventListener('message', e => {
+                if (e.data?.channel === '__QEC_JW_BRIDGE_V1__' &&
+                    e.data?.direction === 'main-to-isolated') {
+                  window.__jwRawEvents.push(e.data);
+                }
+              });
+              const huge = 'x'.repeat(1024 * 1024);
+              for (const handler of (window.__jwHandlers.get('buffer') || [])) {
+                handler({opaque: huge, providerObject: {stream: huge}});
+              }
+              for (const handler of (window.__jwHandlers.get('cast') || [])) {
+                handler({active:true, available:true, deviceName:'Fixture TV', opaque: huge});
+              }
+            }""")
+            jw.wait_for_function("window.__jwRawEvents.some(m => m.event === 'CAST')")
+            assert jw.evaluate("""() => {
+              const relevant = window.__jwRawEvents.filter(m => ['BUFFER','CAST'].includes(m.event));
+              const cast = relevant.find(m => m.event === 'CAST');
+              return relevant.length === 2 &&
+                relevant.every(m => JSON.stringify(m).length < 2048) &&
+                cast.payload.eventData.active === true &&
+                cast.payload.eventData.deviceName === 'Fixture TV';
+            }""") is True
 
             # A JW wrapper that silently ignores ordinary play must escalate
             # quickly instead of waiting for the full 12-second startup bound.
@@ -737,6 +790,25 @@ window.chrome.runtime.sendMessage = function(message) {
             cast_page.wait_for_function("window.__qecMessages.some(m => m.type === 'CAST_STATUS' && m.payload.traceEvent === 'LOAD_MEDIA_SUCCEEDED:framework-instance:title')")
             cast_page.wait_for_function("window.__qecMessages.some(m => m.type === 'CAST_STATUS' && m.payload.traceEvent === 'LOAD_MEDIA_SUCCEEDED:legacy:title')")
             cast_page.wait_for_function("window.__qecMessages.some(m => m.type === 'MEDIA_PLAYING' && m.payload.playerKind === 'GoogleCast')")
+            # RemotePlayerController may fire very frequently while seeking or
+            # refreshing progress. State changes must remain immediate but
+            # progress-only STATUS messages must be rate-limited.
+            status_burst = cast_page.evaluate("""() => {
+              window.__castBridgeStatusEvents = [];
+              window.addEventListener('message', e => {
+                if (e.data?.channel === '__QEC_CAST_BRIDGE_V1__' &&
+                    e.data?.direction === 'main-to-isolated' && e.data.event === 'STATUS') {
+                  window.__castBridgeStatusEvents.push(e.data.payload);
+                }
+              });
+              for (let i=0; i<100; i++) {
+                window.__castRemotePlayer.currentTime = 100+i/10;
+                window.__emitCastRemote('PLAYER_STATE_CHANGED');
+              }
+              return window.__castBridgeStatusEvents.length;
+            }""")
+            assert status_burst <= 2, f"Unbounded Cast progress status burst: {status_burst}"
+            cast_page.wait_for_function("""() => window.__castBridgeStatusEvents.some(m => m.remoteCurrentTime >= 109.9)""", timeout=4000)
             assert cast_page.evaluate("window.__jwCastCalls.includes('play')") is False
             assert cast_page.evaluate("window.__jwCastCalls.some(call => Array.isArray(call) && call[0] === 'requestCast')") is False
             assert "media.example.invalid" not in cast_page.evaluate("JSON.stringify(window.__qecMessages)")
@@ -765,10 +837,12 @@ window.chrome.runtime.sendMessage = function(message) {
             assert seek_to_result["ok"] is True
             assert cast_page.evaluate("window.__castRemotePlayer.currentTime") == 12
             assert cast_page.evaluate("JSON.stringify(window.__castRemoteControlCalls)") == '["playOrPause",["seek",100],["seek",12]]'
-            # Restore the separate near-end completion precondition before
-            # exercising the existing media-unload normalization below.
+            # Original v0.5.16 media-unload completion path. Do not enable
+            # unverified near-end clock-stall recovery in the first-start release.
             cast_page.evaluate("""
+              window.__castMedia.playerState = 'PLAYING';
               const p = window.__castRemotePlayer;
+              p.playerState = 'PLAYING';
               p.currentTime = 98;
               p.duration = 100;
               window.__emitCastRemote('MEDIA_INFO_CHANGED');
@@ -1056,6 +1130,18 @@ window.jwplayer = function () { return window.__relaySourcePlayer; };
               ))
             """)
             relay_source.wait_for_function("window.__qecMessages.some(m => m.type === 'CAST_RELAY_ITEM')")
+            # An asynchronously resumed matching sender session must NOT
+            # schedule a second native-Cast-control click after a JW relay has
+            # already begun; the two paths otherwise race for one receiver.
+            relay_source.evaluate("""
+              window.postMessage({
+                channel:'__QEC_CAST_BRIDGE_V1__', direction:'main-to-isolated', event:'STATUS',
+                payload:{connected:true,sessionId:'cast-123',deviceName:'Seb',mediaPlayerState:'PAUSED'}
+              }, '*')
+            """)
+            relay_source.wait_for_function("window.__qecMessages.some(m => m.type === 'CAST_STATUS' && m.payload.connected === true)")
+            assert relay_source.evaluate("window.__qecMessages.some(m => m.type === 'CAST_HANDOFF_REQUIRED')") is False, \
+                "JW Cast relay and trusted native-Cast rejoin must be mutually exclusive"
             assert relay_source.evaluate("window.__relaySourceCalls.includes('getPlaylistItem')") is True
             assert relay_source.evaluate("window.__relaySourceCalls.includes('play')") is False
             relay_payload = relay_source.evaluate("window.__qecMessages.find(m => m.type === 'CAST_RELAY_ITEM').payload.item")

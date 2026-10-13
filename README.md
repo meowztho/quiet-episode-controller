@@ -10,11 +10,102 @@ It keeps the supported episode site open as a controller, opens the selected vid
 - Best used with the controller browser window moved to the monitor where playback should stay fullscreen.
 - `Auto` provider mode with bounded `VOE -> Doodstream` runtime failover.
 - Native JW Player handling plus HTML5/Plyr-style fallback.
-- Experimental sticky Google Cast handoff: choose a device once in the provider player, then QEC attempts to reuse that Cast session for following episodes.
+- Experimental sticky Google Cast handoff: choose a device once through the player/Google picker, then QEC attempts to reuse that Cast session for following episodes.
+- Popup remembers the last fullscreen checkbox preference between sessions and browser restarts; it does not automatically re-enable fullscreen after you turn it off.
 - Supports AniWorld and the SerienStream mirror family through one shared episode-site adapter.
 - No OS mouse movement, global keyboard synthesis, Alt-Tab automation, or forced foreground focus.
 - Project architecture, acceptance evidence, tests, and agent handoff material are versioned with the source.
 
+
+## v0.5.19 serialize Cast handoff state transitions (2026-10-13)
+
+User observed Chromecast continuing for three episodes, then a 0-second
+playback stall and `BLOCKED / PLAYBACK_SURFACE_CLOSED` after a relay trace.
+The specific physical device failure is not yet reproduced locally.
+
+A deterministic concurrency test did reproduce a separate state corruption:
+Cast STATUS processing can hold a stale session write while the sender is
+promoted by `CAST_RELAY_PLAYING` and the episode helper is closed. The stale
+write then restores the deleted helper as the canonical playback tab, making
+its removal transition the session to `PLAYBACK_SURFACE_CLOSED`.
+
+The service worker now serializes media/Cast/relay messages and tab removals
+through one bounded transaction sequence; Stop uses the same sequence. This
+preserves the single canonical tab assignment without introducing a periodic
+reconnect loop, provider media inspection, or additional Cast commands.
+The regression fails against v0.5.18 and passes with the fix. A Cast receiver
+reporting `PLAYING` at zero seconds is **not** proven to have successfully
+started the next episode; future device-level evidence is needed before
+changing success criteria or adding automatic recovery.
+
+## v0.5.18 cautious rollback of Cast end-stall recovery (2026-10-12)
+
+Live Edge feedback: v0.5.17 opened the first provider tab but playback did not start.
+The v0.5.17 change only affects Cast end detection and cannot by itself prove
+why the local first player did not autoplay. To restore the last previously
+working baseline while preserving the proven v0.5.16 JW STATUS/viewport-loop
+memory fix, v0.5.18 restores the v0.5.16 Cast bridge unchanged.
+
+The experimental near-end PLAYING-stall trigger from v0.5.17 is **withdrawn**,
+not considered solved. Original Cast FINISHED and media-unloaded completion
+continue to work. First-episode JW startup with the Cast bridge injected is
+included in the fixture suite. The live Edge failure needs new observation if
+it persists after fully reloading the extension and provider tabs.
+
+## v0.5.17 Cast near-end rollover fallback (2026-10-12)
+
+Some Cast receivers may remain at a displayed position such as 24:05 / 24:15
+without emitting `IDLE/FINISHED` or unloading the media. The Cast bridge now
+recognizes the final 12 seconds as a *candidate window*, not a command to skip.
+If the remote receiver stays in `PLAYING`, has demonstrably advanced inside
+that window, and then fails to advance for 10 seconds, it sends exactly one
+canonical `REMOTE_ENDED` (`NEAR_END_PROGRESS_STALLED`) event. Genuine Cast
+`FINISHED` remains preferred; unloaded `IDLE` near-end fallback also accepts
+up to 12 seconds of duration mismatch, excluding explicit cancellation/error
+idle reasons. Pause, buffering, unproven seeks, and media-session changes do
+not start or carry over the stall timer. The controller still performs the
+existing single next-episode transition; no speculative extra tabs are opened.
+
+Chromium Cast fixtures prove the new cases and fail against v0.5.16. **Real
+VOE + Chromecast end-of-episode behavior is not yet verified.**
+
+## v0.5.16 JW Player memory-loop fix (2026-10-12)
+
+Edge user measurements on the same paused VOE/JW episode showed a renderer
+process growing from 971,476 KB to 3,863,548 KB, with roughly 100% CPU.
+An additional AniWorld tab playing the same video did not exhibit the growth.
+These observations locate the pressure in the provider renderer but do not,
+on their own, prove which script caused it.
+
+Code-level root cause: `frame-agent.js` responded to JW `STATUS` with
+`PRESENT_VIEWPORT`, and `jw-main-bridge.js` responded to that presentation
+command with a new `STATUS`, creating an unbounded `window.postMessage` cycle.
+A guarded Chromium A/B repro on the original source reached 26 viewport
+commands and 26 status responses before its safety cap; the corrected source
+settled after one of each. The agent now only synchronizes presentation on
+player availability/readiness or real viewport resize; the JW bridge no longer
+acknowledges a presentation command with a status snapshot. An explicit `PROBE`
+continues to return player status.
+
+All local unit/fixture/static/package/project checks pass, including a new JW
+feedback-loop regression. **Actual memory stabilization during a long pause or
+Cast standby/rejoin in user Edge remains to be confirmed.**
+
+## v0.5.15 resource-use hardening (2026-10-12)
+
+- Main-world JW event forwarding is now field-selective: full provider/player
+  event objects no longer cross the `window.postMessage` boundary, except for
+  the explicitly authorized, one-shot opaque JW Cast playlist-item relay.
+- Cast progress-only status updates are coalesced to at most one per second;
+  session/receiver changes and remote playback-ended transitions still emit
+  immediately. This reduces background message and `storage.session` churn.
+- HTML5 player diagnostics no longer transfer/persist `currentSrc` media URLs.
+- Synthetic Chromium fixtures exercise a 1 MiB opaque JW event, 100 rapid
+  Cast progress events, and omission of HTML5 source identifiers.
+
+These tests bound identified resource-pressure paths but do not establish the
+cause of a real Chromium out-of-memory crash. A real long-running Edge/Cast
+memory check is still required.
 
 ## Installation
 
@@ -46,7 +137,7 @@ When updating an already installed development build, replace the files in the s
 2. **Recommended for a second monitor:** drag that episode tab into its own Edge/Chrome window and move this window to the monitor where you want the video to play. QEC creates the temporary provider playback tab in this same browser window and can fullscreen that window.
 3. Open the QEC popup.
 4. Leave **Hoster** on `Auto` for automatic `VOE -> Doodstream` selection and runtime fallback, or choose one provider explicitly.
-5. Leave **Edge/Chrome-Fenster für Wiedergabe im Vollbild** enabled if you want the playback window fullscreen.
+5. Set **Edge/Chrome-Fenster für Wiedergabe im Vollbild** according to your preference. The checkbox retains your most recent selection.
 6. Click **Start** once.
 7. After playback starts, you can switch back to your game or other work. QEC does not use OS mouse movement, OS keyboard automation or forced Alt-Tab/focus changes.
 8. When the episode ends, QEC closes the temporary playback tab, advances the controller page to the next episode, opens the next provider tab and starts playback automatically.
@@ -71,7 +162,7 @@ QEC v0.5.7 experiments with **retaining the provider tab that already owns the r
 For the first test:
 
 1. Start QEC normally and let the provider video begin.
-2. Use the **Cast button inside the provider player** and choose your Chromecast/Google Cast device once.
+2. Use the **Cast button inside the provider player**, or the popup's **Chromecast auswählen** shortcut when available, to open the provider/Google-owned device picker. Choose your Chromecast/Google Cast device once.
 3. Leave the session running. A real framework/remote event — not JW's `cast.active` flag alone — is required before QEC treats Cast as connected.
 4. When the remote episode ends, QEC advances the controller and opens the next same-provider VOE/JW page as a temporary helper while the previous provider tab remains alive as the actual Cast sender.
 5. The helper obtains its current provider-owned JW playlist item and relays that object **once, opaquely and transiently** to the retained sender. QEC does not persist or log its media fields.
@@ -236,3 +327,14 @@ A live VOE Chromecast session can be fully authoritative even when the provider 
 The popup reports the selected Cast driver (`FRAMEWORK_REMOTE_PLAYER` or `LEGACY_MEDIA`) for live diagnostics. Doodstream automatic Cast rollover remains deferred.
 
 Live Edge/Chromecast verification on 2026-09-28 confirmed the v0.5.13 control surface works on VOE and remains usable after the automatic next-episode rollover. This closes the VOE remote-control live check. Doodstream/playmogo retained-Cast rollover remains intentionally deferred and is not claimed as verified.
+
+## v0.5.14 Cast handoff and tab lifecycle
+
+- Popup fullscreen state is saved in `chrome.storage.local` and restored before normal popup status polling begins. Turning fullscreen off remains off across sessions.
+- While a real Chromecast session already owns playback, the next same-provider JW page is opened as **one inactive helper tab**. The retained sender stays alive; successful remote `PLAYING` promotes the retained sender and immediately closes the helper. On bounded Cast-resume failure the retiring sender closes and the helper becomes the local fallback.
+- Duplicate controller load-complete events cannot start concurrent episode preparations. This prevents duplicate helper tabs for the same episode.
+- A newly created provider tab is registered with the canonical session before following its redirect, so **Stop** and closing the controller can close it even while navigation is unresolved. Stale in-flight Start completion cannot revive a stopped session. Stopping during a pending Cast relay closes both the sender and helper.
+- At most **one retained sender plus one helper** may overlap during Cast continuity (the controller tab is separate). No third QEC playback tab is intended. A short-lived helper tab can be created without becoming foreground-visible; a tab not appearing on screen is not proof it never existed.
+- The new **Chromecast auswählen** button triggers the existing provider-owned native Cast control only when a supported player reports Cast availability. Receiver discovery/selection remains Google/provider-owned: QEC does not directly enumerate Chromecast devices or load Cast media itself.
+
+Local verification: 56/56 Node unit/orchestration tests, both browser fixture suites, static check, extension package validation, and Project Gate pass. Those fixtures include the episode 1 → 2 → 3 retained-JW-sender handoff, duplicate controller-complete events, Stop during unresolved redirect, and Stop during pending relay. **Real multi-episode VOE/Chromecast testing for this revision remains outstanding**; fixture results are not live-device proof.

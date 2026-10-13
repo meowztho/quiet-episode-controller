@@ -400,6 +400,11 @@ export function recordMedia(session, type, payload = {}) {
     };
   }
 
+  // Local JW/HTML5 ended events must not advance the episode while the
+  // receiver is the proven playback authority. Only remote Cast completion
+  // may end a Cast-owned episode.
+  if (remoteCastOwnsPlayback) return { session, action: null };
+
   if (session.state !== SessionState.RUNNING || session.transitionToken) {
     return { session, action: null };
   }

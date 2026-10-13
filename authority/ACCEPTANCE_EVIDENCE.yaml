@@ -248,6 +248,14 @@
           "surface": "Microsoft Edge (user profile)",
           "result": "PARTIAL",
           "notes": "Doodstream reached fullscreen with an existing provider control surface, but v0.3.3 also layered QEC HTML5 controls over it. This live failure motivated the single-control-owner correction in v0.3.4; live verification of the correction is pending."
+        },
+        {
+          "class": "fixture",
+          "revision": "v0.5.16-worktree",
+          "date": "2026-10-12",
+          "command": "python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS",
+          "notes": "Reproduced an unbounded postMessage feedback cycle on existing JW bridge source with safety cap (26 STATUS and 26 PRESENT_VIEWPORT); fixed agent/bridge code settles after one status and one viewport command. Fixture asserts repeated PROBE/STATUS cannot resize, while READY and browser resize still each resize once. Original live VOE renderer memory growth remains open for long-paused device retest."
         }
       ]
     },
@@ -562,6 +570,22 @@
           "command": "User live multi-episode Cast rollover observation",
           "result": "PARTIAL / TWO SUCCESSIVE EPISODE TRANSITIONS",
           "notes": "Episode 8 -> 9 and 9 -> 10 both advanced and played on Chromecast. This supports transition deduplication/continuity but does not by itself prove the full M6 criterion for orphan tabs, extra windows, retries, and focus behavior, so A-M6-001 remains UNVERIFIED."
+        },
+        {
+          "class": "test",
+          "revision": "v0.5.14 worktree",
+          "date": "2026-10-12",
+          "command": "npm run check",
+          "result": "PASS (56/56 unit/orchestration, DOM/provider fixtures, static/package/project gates)",
+          "notes": "Synthetic duplicate controller-complete notifications no longer generate a duplicate helper; Stop during provider redirect closes its registered in-flight tab without resurrecting the stopped session; Stop during retained JW Cast relay closes sender and helper; two successive successful opaque JW relays each close the helper and retain the canonical sender. No live Chromecast/browser-tab-count claim follows from fixtures; M6 remains UNVERIFIED."
+        },
+        {
+          "class": "fixture",
+          "revision": "v0.5.15 worktree",
+          "date": "2026-10-12",
+          "command": "python tests/browser/run_provider_fixture_tests.py",
+          "result": "PASS (resource-boundary regression fixtures)",
+          "notes": "A large 1 MiB opaque JW player event no longer crosses the message boundary; 100 rapid Cast progress events coalesce to <=2 immediate STATUS messages while latest progress arrives within the interval; HTML5 MEDIA payloads omit currentSrc. This exercises local resource pressure only, does not measure real Edge heap usage, and does not verify complete M6/no-OOM."
         }
       ]
     },

@@ -90,7 +90,28 @@
     ];
 
     for (const [jwEvent, qecEvent] of events) {
-      const handler = (eventData = {}) => post(qecEvent, { ...snapshot(player), eventData });
+      const handler = (eventData = {}) => {
+        // Provider event objects can include entire playlist graphs, native
+        // objects, or large/non-cloneable media metadata. Never forward them
+        // wholesale through postMessage. Only two events need small details.
+        let details = null;
+        if (jwEvent === "cast") {
+          details = {
+            active: Boolean(eventData?.active),
+            available: Boolean(eventData?.available),
+            deviceName: typeof eventData?.deviceName === "string"
+              ? eventData.deviceName.slice(0, 160)
+              : null
+          };
+        } else if (jwEvent === "error") {
+          details = {
+            message: typeof eventData?.message === "string"
+              ? eventData.message.slice(0, 512)
+              : null
+          };
+        }
+        post(qecEvent, details ? { ...snapshot(player), eventData: details } : snapshot(player));
+      };
       try {
         player.on(jwEvent, handler);
         boundHandlers.push([jwEvent, handler]);
@@ -143,7 +164,9 @@
           if (typeof player.setControls === "function") player.setControls(true);
           if (typeof player.setAllowFullscreen === "function") player.setAllowFullscreen(true);
           if (typeof player.resize === "function") player.resize("100%", height);
-          post("STATUS", snapshot(player));
+          // This command only updates presentation. An automatic STATUS reply
+          // would feed back into viewport synchronization in older agents.
+          // Explicit PROBE already owns on-demand status snapshots.
           break;
         }
         case "SEEK":

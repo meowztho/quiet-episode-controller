@@ -1,6 +1,7 @@
 import { CastRemoteAction, envelope, MessageType, PlaybackAuthority, SessionLifecycle, SessionState } from "../core/protocol.js";
 import { permissionPatternForOrigin } from "../permissions/permission-broker.js";
 import { DEFAULT_PROVIDER_PRIORITY } from "../providers/registry.js";
+import { readFullscreenPreference, writeFullscreenPreference } from "./preferences.js";
 
 const els = {
   state: document.querySelector("#state"),
@@ -10,6 +11,7 @@ const els = {
   start: document.querySelector("#start"),
   stop: document.querySelector("#stop"),
   grant: document.querySelector("#grant"),
+  castConnect: document.querySelector("#cast-connect"),
   castControls: document.querySelector("#cast-controls"),
   castBack: document.querySelector("#cast-back"),
   castToggle: document.querySelector("#cast-toggle"),
@@ -107,6 +109,13 @@ function render(status) {
   els.fullscreen.disabled = active;
   els.stop.disabled = !active;
   els.grant.hidden = status?.blockedReason !== "PROVIDER_PERMISSION_REQUIRED" || !status?.pendingPermissionOrigin;
+  const playerKind = status?.lastMedia?.payload?.playerKind;
+  els.castConnect.hidden = !(
+    active && Number.isInteger(status?.playbackTabId) &&
+    !status?.cast?.connected &&
+    status?.cast?.available &&
+    (playerKind === "JWPlayer" || playerKind === "HTML5")
+  );
 
   const castState = String(status?.cast?.mediaPlayerState || "").toUpperCase();
   const castControlActive = Boolean(
@@ -169,6 +178,23 @@ els.start.addEventListener("click", async () => {
   }
 });
 
+els.fullscreen.addEventListener("change", async () => {
+  try {
+    await writeFullscreenPreference(chrome.storage.local, els.fullscreen.checked);
+  } catch (error) {
+    els.error.textContent = `Vollbild-Einstellung nicht gespeichert: ${String(error?.message || error)}`;
+  }
+});
+
+els.castConnect.addEventListener("click", async () => {
+  try {
+    els.error.textContent = "";
+    await send(MessageType.CAST_CONNECT);
+  } catch (error) {
+    els.error.textContent = String(error?.message || error);
+  }
+});
+
 els.stop.addEventListener("click", async () => {
   try {
     els.error.textContent = "";
@@ -217,5 +243,14 @@ els.grant.addEventListener("click", async () => {
   }
 });
 
-void refresh();
-setInterval(refresh, 1000);
+async function initialize() {
+  try {
+    els.fullscreen.checked = await readFullscreenPreference(chrome.storage.local);
+  } catch (error) {
+    els.error.textContent = `Vollbild-Einstellung nicht geladen: ${String(error?.message || error)}`;
+  }
+  await refresh();
+  setInterval(refresh, 1000);
+}
+
+void initialize();

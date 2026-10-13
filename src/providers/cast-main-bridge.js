@@ -15,6 +15,8 @@
   let lastRejoinAttemptAt = 0;
   let configuredReceiverApplicationId = null;
   let lastStatusKey = null;
+  let lastStatusCoreKey = null;
+  let lastStatusPostAt = 0;
   let lastPlayingMediaSessionId = null;
   let lastFinishedMediaSessionId = null;
   let remotePlayer = null;
@@ -483,8 +485,17 @@
     maybeRejoin(status);
 
     const key = JSON.stringify(status);
-    if (key !== lastStatusKey) {
+    // A provider can emit hundreds of remote-player events while its seek
+    // position changes. Keep semantic transitions immediate, but publish
+    // progress-only changes at most once per poll interval. This bounds the
+    // message + extension-storage work without slowing episode-end signals.
+    const coreKey = JSON.stringify({ ...status, remoteCurrentTime: null });
+    const now = Date.now();
+    if (key !== lastStatusKey &&
+        (coreKey !== lastStatusCoreKey || now - lastStatusPostAt >= POLL_MS)) {
       lastStatusKey = key;
+      lastStatusCoreKey = coreKey;
+      lastStatusPostAt = now;
       post(status.available ? "STATUS" : "UNAVAILABLE", status);
     }
 

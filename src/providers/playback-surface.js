@@ -80,7 +80,8 @@ export async function openPlaybackSurface({
   candidate,
   baseUrl,
   timeoutMs = DEFAULT_TIMEOUT_MS,
-  intervalMs = DEFAULT_INTERVAL_MS
+  intervalMs = DEFAULT_INTERVAL_MS,
+  onCreated = null
 }) {
   const entry = providerEntryUrl(candidate, baseUrl);
   if (!entry) throw new Error("PROVIDER_TARGET_NOT_FOUND");
@@ -94,6 +95,7 @@ export async function openPlaybackSurface({
   if (!Number.isInteger(tab?.id)) throw new Error("PLAYBACK_TAB_CREATE_FAILED");
 
   try {
+    if (onCreated) await onCreated(tab.id);
     const document = await waitForExternalPlaybackDocument(tab.id, sourceOrigin, { timeoutMs, intervalMs });
     return { tabId: tab.id, entryUrl: entry.href, document };
   } catch (error) {

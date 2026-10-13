@@ -221,7 +221,15 @@ async function attachPlaybackSurface(session) {
       return blocked;
     }
 
-    await activatePlaybackSurface(session.playbackTabId);
+    // The retiring Cast sender remains visible while a temporary helper
+    // loads the next provider-owned JW item. Only activate the helper if
+    // remote continuation fails and local fallback is needed.
+    const retainedCastHelper = Boolean(
+      session.cast?.sticky &&
+      Number.isInteger(session.retiringPlaybackTabId) &&
+      session.retiringPlaybackProvider === session.selectedProvider?.provider
+    );
+    if (!retainedCastHelper) await activatePlaybackSurface(session.playbackTabId);
 
     const result = await injectAndHandshakeProvider(session, document);
     if (result.attached) {
@@ -246,10 +254,25 @@ async function openSelectedPlayback(session) {
     candidate: session.selectedProvider,
     baseUrl: session.currentEpisode?.url,
     timeoutMs: PLAYBACK_NAVIGATION_TIMEOUT_MS,
-    intervalMs: PLAYBACK_NAVIGATION_INTERVAL_MS
+    intervalMs: PLAYBACK_NAVIGATION_INTERVAL_MS,
+    // Register the tab as soon as it exists, not after redirect settlement:
+    // Stop/controller-close must be able to find and close an in-flight tab.
+    onCreated: async (tabId) => {
+      const current = await loadCurrentSession();
+      if (!isSessionActive(current) || current.sessionId !== session.sessionId || current.epoch !== session.epoch) {
+        throw new Error("PLAYBACK_OPEN_CANCELLED");
+      }
+      session = setPlaybackTab(session, tabId);
+      await saveSession(session);
+    }
   });
 
-  session = setPlaybackTab(session, opened.tabId);
+  const current = await loadCurrentSession();
+  if (!isSessionActive(current) || current.sessionId !== session.sessionId ||
+      current.epoch !== session.epoch || current.playbackTabId !== opened.tabId) {
+    await closePlaybackSurface(opened.tabId);
+    throw new Error("PLAYBACK_OPEN_CANCELLED");
+  }
   session = setPlaybackDocument(session, opened.document);
   await saveSession(session);
   return await attachPlaybackSurface(session);
@@ -315,7 +338,8 @@ async function openProviderCandidateLoop(session, probe) {
     } catch (error) {
       const reason = String(error?.message || error);
       const persisted = await loadCurrentSession();
-      if (persisted?.sessionId === session.sessionId) session = persisted;
+      if (!isSessionActive(persisted) || persisted.sessionId !== session.sessionId) return persisted;
+      session = persisted;
 
       if (!session.providerFailoverEnabled) {
         if (Number.isInteger(session.playbackTabId)) session = await finishPlaybackTab(session);
@@ -371,7 +395,9 @@ async function prepareEpisode(session, { enterWindow = false } = {}) {
     }
 
     const probe = await probeEpisode(session.tabId);
-    session = beginEpisode(session, probe);
+    const current = await loadCurrentSession();
+    if (!isSessionActive(current) || current.sessionId !== session.sessionId) return current;
+    session = beginEpisode(current, probe);
     await saveSession(session);
     if (session.state === SessionState.BLOCKED) return session;
 
@@ -381,8 +407,10 @@ async function prepareEpisode(session, { enterWindow = false } = {}) {
     }
     return session;
   } catch (error) {
+    const current = await loadCurrentSession();
+    if (!isSessionActive(current) || current.sessionId !== session.sessionId) return current;
     const reason = String(error?.message || error);
-    session = block(session, reason, [reason]);
+    session = block(current, reason, [reason]);
     await saveSession(session);
     return session;
   }
@@ -468,6 +496,27 @@ async function sendCastRemoteControl(session, payload = {}, { requireAuthority =
   );
   if (!response?.ok) throw new Error(response?.reason || "CAST_REMOTE_CONTROL_FAILED");
   return response;
+}
+
+async function handleCastConnect() {
+  const session = await loadCurrentSession();
+  if (!isSessionActive(session) || !Number.isInteger(session.playbackTabId)) {
+    throw new Error("CAST_CONNECT_PLAYBACK_UNAVAILABLE");
+  }
+  if (session.cast?.connected || session.playbackAuthority === PlaybackAuthority.CAST) {
+    throw new Error("CAST_ALREADY_CONNECTED");
+  }
+  const playerKind = session.lastMedia?.payload?.playerKind;
+  if (!session.cast?.available || !["JWPlayer", "HTML5"].includes(playerKind)) {
+    throw new Error("CAST_PLAYER_NOT_READY");
+  }
+  // This is only a shortcut to the provider's visible native Cast control.
+  // The provider/Google UI remains the sole device selector and media owner.
+  const result = playerKind === "JWPlayer"
+    ? await invokeTrustedJwCast(session.playbackTabId)
+    : await invokeTrustedHtml5Cast(session.playbackTabId);
+  if (!result.ok) throw new Error(result.reason || "CAST_NATIVE_CONTROL_UNAVAILABLE");
+  return publicStatus(session);
 }
 
 async function handleCastRemoteControl(payload) {
@@ -682,6 +731,9 @@ async function handleMediaMessage(message, sender) {
     await saveSession(session);
     if (message.payload?.stickyResumeFailed && Number.isInteger(session.retiringPlaybackTabId)) {
       session = await finishRetiringPlaybackTab(session);
+      if (Number.isInteger(session.playbackTabId)) {
+        await activatePlaybackSurface(session.playbackTabId);
+      }
     }
     return;
   }
@@ -812,6 +864,16 @@ async function handleMediaMessage(message, sender) {
   }
 }
 
+// Chrome delivers Cast status, relay confirmation and tab removal independently.
+// Serialize their read/modify/write transactions: an older STATUS write must
+// not restore a helper as canonical after CAST_RELAY_PLAYING promotes its sender.
+let sessionTransitionTail = Promise.resolve();
+function serializeSessionTransition(operation) {
+  const result = sessionTransitionTail.then(operation);
+  sessionTransitionTail = result.catch(() => {});
+  return result;
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!isEnvelope(message)) return;
 
@@ -822,19 +884,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MessageType.START:
         return { ok: true, version: PROTOCOL_VERSION, status: await handleStart(message.payload) };
       case MessageType.STOP:
-        return { ok: true, version: PROTOCOL_VERSION, status: await handleStop() };
+        return { ok: true, version: PROTOCOL_VERSION, status: await serializeSessionTransition(() => handleStop()) };
       case MessageType.CAST_REMOTE_CONTROL:
         return { ok: true, version: PROTOCOL_VERSION, status: await handleCastRemoteControl(message.payload) };
+      case MessageType.CAST_CONNECT:
+        return { ok: true, version: PROTOCOL_VERSION, status: await handleCastConnect() };
       case MessageType.PERMISSION_GRANTED:
         return { ok: true, version: PROTOCOL_VERSION, status: await handlePermissionGranted() };
       case MessageType.CAST_RELAY_ITEM:
-        await handleCastRelayItem(message, sender);
+        await serializeSessionTransition(() => handleCastRelayItem(message, sender));
         return { ok: true, version: PROTOCOL_VERSION };
       case MessageType.CAST_RELAY_PLAYING:
-        await handleCastRelayPlaying(message, sender);
+        await serializeSessionTransition(() => handleCastRelayPlaying(message, sender));
         return { ok: true, version: PROTOCOL_VERSION };
       case MessageType.CAST_RELAY_FAILED:
-        await handleCastRelayFailed(message, sender);
+        await serializeSessionTransition(() => handleCastRelayFailed(message, sender));
         return { ok: true, version: PROTOCOL_VERSION };
       case MessageType.MEDIA_FOUND:
       case MessageType.MEDIA_PLAYING:
@@ -845,7 +909,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MessageType.MEDIA_REPLACED:
       case MessageType.CAST_STATUS:
       case MessageType.CAST_HANDOFF_REQUIRED:
-        await handleMediaMessage(message, sender);
+        await serializeSessionTransition(() => handleMediaMessage(message, sender));
         return { ok: true, version: PROTOCOL_VERSION };
       default:
         return { ok: false, version: PROTOCOL_VERSION, error: "UNKNOWN_MESSAGE_TYPE" };
@@ -856,18 +920,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
+// One episode preparation at a time. A controller navigation can emit multiple
+// completion events before the first asynchronous provider tab is registered.
+let navigationOperation = null;
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
-  if (changeInfo.status !== "complete") return;
-  (async () => {
-    let session = await loadCurrentSession();
+  if (changeInfo.status !== "complete" || navigationOperation) return;
+  const operation = (async () => {
+    const session = await loadCurrentSession();
     if (!session || session.tabId !== tabId || session.state !== SessionState.NAVIGATING) return;
-    session = await prepareEpisode(session, { enterWindow: false });
-    await saveSession(session);
-  })().catch(() => {});
+    await prepareEpisode(session, { enterWindow: false });
+  })();
+  navigationOperation = operation;
+  void operation.catch(() => {}).finally(() => {
+    if (navigationOperation === operation) navigationOperation = null;
+  });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  (async () => {
+  void serializeSessionTransition(async () => {
     let session = await loadCurrentSession();
     if (!isSessionActive(session)) return;
 
@@ -901,5 +971,5 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       await saveSession(session);
       if (hadRelay) await notifyCastRelayFailure(session, "CAST_RELAY_SENDER_CLOSED");
     }
-  })().catch(() => {});
+  }).catch(() => {});
 });

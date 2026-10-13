@@ -49,6 +49,41 @@ Cover:
 - video replacement;
 - autoplay block.
 
+## JW bridge feedback-loop regression
+
+A provider fixture must verify that `PROBE`/JW `STATUS` do not cause additional
+`PRESENT_VIEWPORT` commands, while JW `READY` and real window resize still
+synchronize presentation once per trigger. The prior implementation loop was
+bounded during diagnosis to avoid saturating Chromium memory; the baseline
+reached the safety cap at 26 viewport/status pairs, and the corrected code
+settled after one initial viewport command and one status response. This
+fixture is not a long-duration Edge/Chromecast memory measurement.
+
+## Cast relay state-write ordering
+
+Simulate an older `CAST_STATUS` session-storage write held during
+`CAST_RELAY_PLAYING` promotion. After the confirmed handoff closes the helper,
+its tab-removal event must never resurrect the helper as canonical or enter
+`PLAYBACK_SURFACE_CLOSED`. The test must fail against the previous unprotected
+background dispatcher. Keep explicit Stop and stale message behavior intact.
+This does not establish true Cast media progress at the receiver.
+
+## First-episode JW startup with Cast bridge present
+
+Load the real JW and Cast main-world bridges together, attach a provider on a
+fresh episode with no retained Cast session, and verify JW normal `PLAY` reaches
+`MEDIA_PLAYING` with no unexpected Cast handoff. This fixture cannot establish
+live provider autoplay policy or the exact cause of the user's Edge symptom.
+
+## Deferred Cast near-end completion recovery
+
+v0.5.17's experimental timer-based end fallback was withdrawn in v0.5.18
+after a user reported that even first-episode player start stopped working.
+Until a hardware-level reproduction identifies an appropriate trigger, keep
+the v0.5.16 Cast completion behavior and do not treat a near-end paused player
+as a completed episode. A future change must be tested together with cold
+initial start and connected/reconnected Chromecast playback.
+
 ## 5. Extension/live Edge verification
 For each provider family record:
 - date/revision;

@@ -274,6 +274,22 @@ test("remote Cast authority ignores unrelated local JW playback failures until C
   assert.equal(session.playbackAuthority, PlaybackAuthority.NONE);
 });
 
+test("local JW completion cannot advance an episode while Chromecast owns playback", () => {
+  let session = runningSession();
+  session = recordCastStatus(session, {
+    available: true, connected: true, sessionId: "cast-123", mediaPlayerState: "PLAYING"
+  });
+  const localEnd = recordMedia(session, "MEDIA_ENDED", { playerKind: "JWPlayer" });
+  assert.equal(localEnd.action, null);
+  assert.equal(localEnd.session.state, SessionState.RUNNING);
+  assert.equal(localEnd.session.playbackAuthority, PlaybackAuthority.CAST);
+  assert.equal(localEnd.session.transitionToken, null);
+
+  const castEnd = recordMedia(localEnd.session, "MEDIA_ENDED", { playerKind: "GoogleCast" });
+  assert.equal(castEnd.action?.type, "NAVIGATE_NEXT");
+  assert.equal(castEnd.session.state, SessionState.NAVIGATING);
+});
+
 test("local helper playback cannot steal authority while a retained Cast sender is pending", () => {
   let session = runningSession();
   session = recordCastStatus(session, {

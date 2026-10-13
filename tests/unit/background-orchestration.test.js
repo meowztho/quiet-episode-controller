@@ -26,7 +26,8 @@ const state = {
   castRelayApplyMessages: [],
   castRelayPromoteMessages: [],
   castRelayFailureMessages: [],
-  castRemoteControlMessages: []
+  castRemoteControlMessages: [],
+  pausedSessionWrite: null
 };
 
 const probe = {
@@ -76,6 +77,7 @@ function reset(overrides = {}) {
   state.castRelayPromoteMessages = [];
   state.castRelayFailureMessages = [];
   state.castRemoteControlMessages = [];
+  state.pausedSessionWrite = null;
   Object.assign(state, overrides);
 }
 
@@ -83,7 +85,15 @@ globalThis.chrome = {
   storage: {
     session: {
       async get(key) { return { [key]: state.storage[key] }; },
-      async set(values) { Object.assign(state.storage, values); },
+      async set(values) {
+        const paused = state.pausedSessionWrite;
+        if (paused && values["qec.session"]?.cast?.trace?.at(-1) === "RACE_STATUS") {
+          state.pausedSessionWrite = null;
+          paused.entered();
+          await paused.release;
+        }
+        Object.assign(state.storage, values);
+      },
       async remove(key) { delete state.storage[key]; }
     }
   },
@@ -359,13 +369,20 @@ test("retained Cast sender receives the next JW item transiently and becomes can
     nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
   };
   state.tabUpdatedListener?.(10, { status: "complete" });
+  state.tabUpdatedListener?.(10, { status: "complete" }); // Chromium may report the completed controller document twice.
   await new Promise((resolve) => setTimeout(resolve, 550));
 
   let persisted = state.storage["qec.session"];
+  assert.equal(state.createdTabs.length, 2, "duplicate completion must not create a second helper tab");
   assert.equal(persisted.playbackTabId, 31);
   assert.equal(persisted.retiringPlaybackTabId, 30);
   assert.equal(persisted.retiringPlaybackProvider, "VOE");
   assert.equal(state.attachMessages[1].message.payload.castRelayMode, true);
+  assert.deepEqual(
+    state.tabUpdates.filter((entry) => entry.tabId === 31 && entry.active === true),
+    [],
+    "the next Cast helper must not steal the foreground tab"
+  );
 
   const opaqueItem = {
     title: "Episode 2",
@@ -403,7 +420,159 @@ test("retained Cast sender receives the next JW item transiently and becomes can
   assert.deepEqual(state.removedTabs, [31], "the helper/source tab closes only after remote PLAYING");
   assert.equal(JSON.stringify(state.storage).includes("media.example.invalid"), false);
 
+  // On the second automatic rollover the SAME sender remains in charge.
+  // Each new provider document is just an inactive transient source for an
+  // opaque JW item; no foreground helper or manual Cast selection is needed.
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" }, persisted.sessionId, persisted.epoch), { tab: { id: 30 }, frameId: 0 });
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" },
+    nextEpisode: { ...probe.nextEpisode, episode: 4, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-4" }
+  };
+  state.tabUpdatedListener?.(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  persisted = state.storage["qec.session"];
+  assert.equal(persisted.epoch, 3);
+  assert.equal(persisted.retiringPlaybackTabId, 30);
+  assert.equal(persisted.playbackTabId, 32);
+  assert.equal(state.attachMessages[2].message.payload.castRelayMode, true);
+  assert.equal(state.createdTabs[2].active, false);
+  assert.equal(state.tabUpdates.some((entry) => entry.tabId === 32 && entry.active === true), false);
+
+  const nextItem = { title: "Episode 3", file: "https://media.example.invalid/third.m3u8" };
+  await dispatch(message("CAST_RELAY_ITEM", { item: nextItem }, persisted.sessionId, persisted.epoch), { tab: { id: 32 }, frameId: 0 });
+  const secondTransfer = state.castRelayApplyMessages.at(-1);
+  assert.equal(secondTransfer.tabId, 30, "the original Cast sender is reused for episode 3");
+  assert.match(secondTransfer.message.payload.transferId, /:3:cast-relay$/);
+  await dispatch(message("CAST_RELAY_PLAYING", {
+    transferId: secondTransfer.message.payload.transferId,
+    playerKind: "GoogleCast",
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, 2), { tab: { id: 30 }, frameId: 0 });
+  persisted = state.storage["qec.session"];
+  assert.equal(persisted.currentEpisode.episode, 3);
+  assert.equal(persisted.playbackTabId, 30);
+  assert.equal(persisted.state, "RUNNING");
+  assert.deepEqual(state.removedTabs, [31, 32]);
+  assert.equal(state.tabUpdates.some((entry) => entry.tabId === 32 && entry.active === true), false);
+  assert.equal(JSON.stringify(state.storage).includes("media.example.invalid"), false);
+
   await dispatch(message("POPUP_STOP"));
+});
+
+test("concurrent stale Cast STATUS cannot restore and block a closed relay helper", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", {
+    connected: true, sessionId: "cast-123", deviceName: "Seb",
+    receiverApplicationId: "CC1AD845", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url }
+  };
+  state.tabUpdatedListener(10, { status: "complete" });
+  await new Promise(resolve => setTimeout(resolve, 550));
+  let session = state.storage["qec.session"];
+  assert.equal(session.playbackTabId, 31);
+  assert.equal(session.retiringPlaybackTabId, 30);
+  await dispatch(message("CAST_RELAY_ITEM", { item: { title: "Ep2", sources: [] } },
+    session.sessionId, session.epoch), { tab: { id: 31 }, frameId: 0 });
+  const transferId = state.castRelayApplyMessages.at(-1).message.payload.transferId;
+
+  let entered;
+  const reachedWrite = new Promise(resolve => { entered = resolve; });
+  let release;
+  const releaseWrite = new Promise(resolve => { release = resolve; });
+  state.pausedSessionWrite = { entered, release: releaseWrite };
+  const staleStatus = dispatch(message("CAST_STATUS", {
+    traceEvent: "RACE_STATUS", connected: true, sessionId: "cast-123",
+    mediaPlayerState: "PLAYING"
+  }, session.sessionId, session.epoch), { tab: { id: 31 }, frameId: 0 });
+  await reachedWrite;
+  const confirmed = dispatch(message("CAST_RELAY_PLAYING", {
+    transferId, playerKind: "GoogleCast", connected: true,
+    sessionId: "cast-123", mediaPlayerState: "PLAYING"
+  }, session.sessionId, 1), { tab: { id: 30 }, frameId: 0 });
+  // The pending older write must complete BEFORE relay promotion. The
+  // unprotected baseline finishes the promotion while this write is pending.
+  let promotedEarly = false;
+  confirmed.then(() => { promotedEarly = true; });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  const promotedWhileStatusPending = promotedEarly;
+  release();
+  await Promise.all([staleStatus, confirmed]);
+  state.tabRemovedListener(31);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  session = state.storage["qec.session"];
+  assert.equal(session.playbackTabId, 30);
+  assert.equal(session.retiringPlaybackTabId, null);
+  assert.equal(session.state, "RUNNING");
+  assert.equal(session.blockedReason, null);
+  assert.equal(promotedWhileStatusPending, false, "relay promotion must wait for the earlier status transaction");
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("Stop during an unresolved provider redirect closes its registered tab and cannot resurrect the session", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+  const starting = dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(state.createdTabs.length, 1);
+  assert.equal(state.storage["qec.session"].playbackTabId, 30,
+    "the tab must be registered before waiting for provider navigation");
+
+  const stopped = await dispatch(message("POPUP_STOP"));
+  assert.equal(stopped.status.state, "STOPPED");
+  assert.ok(state.removedTabs.includes(30), "Stop must close a tab still resolving its provider URL");
+  await starting;
+  assert.equal(state.storage["qec.session"].state, "STOPPED", "in-flight Start must not restore an ended session");
+  assert.deepEqual(state.createdTabs.map((tab) => tab.id), [30]);
+  assert.ok(state.removedTabs.includes(30));
+});
+
+test("Stop during a pending JW Cast relay closes both sender and helper without leaking an episode tab", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" }, started.status.sessionId, 1),
+    { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", {
+    available: true, connected: true, sessionId: "cast-123", deviceName: "Seb",
+    receiverApplicationId: "CC1AD845", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, 1), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" }, started.status.sessionId, 1),
+    { tab: { id: 30 }, frameId: 0 });
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+  state.tabUpdatedListener?.(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+  assert.equal(state.storage["qec.session"].playbackTabId, 31);
+  assert.equal(state.storage["qec.session"].retiringPlaybackTabId, 30);
+
+  await dispatch(message("POPUP_STOP"));
+  assert.deepEqual(new Set(state.removedTabs), new Set([30, 31]),
+    "both owned tabs must be closed even when Cast has not acknowledged the handoff");
+  assert.equal(state.storage["qec.session"].state, "STOPPED");
+  await dispatch(message("CAST_RELAY_PLAYING", {
+    transferId: `${started.status.sessionId}:2:cast-relay`, playerKind: "GoogleCast"
+  }, started.status.sessionId, 1), { tab: { id: 30 }, frameId: 0 });
+  assert.equal(state.createdTabs.length, 2, "late remote signals cannot spawn new playback tabs");
 });
 
 test("Doodstream helper keeps the retiring Cast sender until remote confirmation or bounded rejoin failure", async () => {
@@ -470,6 +639,8 @@ test("Doodstream helper keeps the retiring Cast sender until remote confirmation
   persisted = state.storage["qec.session"];
   assert.equal(persisted.retiringPlaybackTabId, null);
   assert.equal(state.removedTabs.includes(30), true, "retiring sender closes only after the bounded Cast rejoin has failed");
+  assert.deepEqual(state.tabUpdates.at(-1), { tabId: 31, active: true },
+    "local fallback must make the previously inactive playback helper visible");
 
   await dispatch(message("POPUP_STOP"));
 });
@@ -1007,4 +1178,34 @@ test("popup Cast remote controls route only to the canonical Cast playback surfa
   await dispatch(message("POPUP_STOP"));
   assert.equal(state.castRemoteControlMessages.length, 2, "Stop should best-effort stop remote Cast media before closing the sender");
   assert.equal(state.castRemoteControlMessages[1].message.payload.action, "STOP");
+});
+
+test("Chromecast button uses provider-owned Cast controls and rejects unavailable surfaces", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  const beforeReady = await dispatch(message("POPUP_CAST_CONNECT"));
+  assert.equal(beforeReady.ok, false);
+  assert.equal(beforeReady.error, "CAST_PLAYER_NOT_READY");
+
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", { available: true, connected: false },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  const connect = await dispatch(message("POPUP_CAST_CONNECT"));
+  assert.equal(connect.ok, true);
+  assert.ok(state.debuggerCommands.some((entry) => entry.method === "Input.dispatchMouseEvent"),
+    "device picker must use the existing bounded native JW control click");
+  assert.deepEqual(state.debuggerAttaches.map((entry) => entry.target.tabId), [30]);
+  assert.deepEqual(state.debuggerDetaches.map((entry) => entry.tabId), [30]);
+
+  await dispatch(message("CAST_STATUS", {
+    available: true, connected: true, sessionId: "cast-123", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  const connected = await dispatch(message("POPUP_CAST_CONNECT"));
+  assert.equal(connected.ok, false);
+  assert.equal(connected.error, "CAST_ALREADY_CONNECTED");
+  assert.equal(state.debuggerAttaches.length, 1);
+  await dispatch(message("POPUP_STOP"));
 });

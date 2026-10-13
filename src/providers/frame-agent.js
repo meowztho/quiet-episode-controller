@@ -83,7 +83,6 @@
       muted: Boolean(video.muted),
       volume: Number.isFinite(video.volume) ? video.volume : null,
       autoplay: Boolean(video.autoplay),
-      currentSrc: video.currentSrc || video.src || null,
       playAttempt: startupAttempt,
       playingObserved
     };
@@ -292,7 +291,7 @@
   }
 
   function maybeTransferStickyCast() {
-    if (!stickyCastRequested()) return false;
+    if (!stickyCastRequested() || config?.castRelayMode) return false;
     if (stickyCastTransferRequested || stickyCastResumeState === "remote" || stickyCastResumeState === "failed") return false;
     if (!stickyCastConnected) return false;
     if (currentPlayerKind !== "jw" || !currentJwContainer) return false;
@@ -405,8 +404,12 @@
     switch (data.event) {
       case "AVAILABLE":
       case "READY":
-      case "STATUS":
+        // Presentation is configured on discovery/ready and actual window resize.
+        // A STATUS is the response to PROBE (and historically PRESENT_VIEWPORT):
+        // resizing in response to it creates an unbounded bridge feedback loop.
         syncJwViewport();
+        // Fall through to the shared status handling.
+      case "STATUS":
         if (!jwFoundEmitted) {
           jwFoundEmitted = true;
           emit("MEDIA_FOUND", status);
@@ -601,7 +604,7 @@
           // episode. Trigger the provider-owned visible Cast control once so
           // the provider remains responsible for its own media load.
           requestTrustedHtml5CastControl("HTML5_CAST_SESSION_REJOINED");
-        } else {
+        } else if (!config?.castRelayMode) {
           maybeTransferStickyCast();
         }
       }
