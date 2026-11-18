@@ -1,7 +1,13 @@
 import { PlaybackAuthority, SessionLifecycle, SessionState } from "./protocol.js";
 
+export const SESSION_SCHEMA_VERSION = 8;
+export const PREPARE_STALL_TIMEOUT_MS = 30000;
+export const PREPARE_STALL_RECOVERY_LIMIT = 1;
+
 function copy(session, patch) {
-  return { ...session, ...patch, updatedAt: Date.now() };
+  const next = { ...session, ...patch, updatedAt: Date.now() };
+  if (patch.state !== undefined && patch.state !== session.state) next.phaseStartedAt = next.updatedAt;
+  return next;
 }
 
 export function createSession({ sessionId, tabId, windowId, fullscreen = true, providerPriority = [], providerFailoverEnabled = false }) {
@@ -9,7 +15,7 @@ export function createSession({ sessionId, tabId, windowId, fullscreen = true, p
     throw new TypeError("sessionId, tabId and windowId are required");
   }
   return {
-    schemaVersion: 8,
+    schemaVersion: SESSION_SCHEMA_VERSION,
     sessionId,
     lifecycle: SessionLifecycle.ACTIVE,
     state: SessionState.ARMING,
@@ -30,8 +36,14 @@ export function createSession({ sessionId, tabId, windowId, fullscreen = true, p
     nextEpisode: null,
     selectedProvider: null,
     pendingPermissionOrigin: null,
+    permissionBlockKind: null,
+    permissionResumeKey: null,
+    lastGrantedPermissionOrigin: null,
     blockedReason: null,
     transitionToken: null,
+    phaseStartedAt: Date.now(),
+    stallRecoveryAttempts: 0,
+    stallRecoveryPending: false,
     originalWindowState: null,
     changedWindowMode: false,
     playbackActivationAttempts: 0,
@@ -59,10 +71,33 @@ export function isSessionActive(session) {
   return Boolean(session && session.lifecycle === SessionLifecycle.ACTIVE);
 }
 
-export function isTerminal(session) {
+function isTerminal(session) {
   if (!session) return true;
   if (session.lifecycle === SessionLifecycle.ENDED) return true;
   return [SessionState.STOPPED, SessionState.COMPLETED].includes(session.state);
+}
+
+// A prepare is stalled only when the global session still owns the browser, no
+// playback surface is registered, and the episode phase has not advanced for a
+// full stall window. The timestamp is persisted with the session, so worker
+// suspension does not erase the evidence.
+export function isPrepareStalled(session, now = Date.now()) {
+  if (!isSessionActive(session)) return false;
+  if (![SessionState.NAVIGATING, SessionState.ARMING].includes(session.state)) return false;
+  if (Number.isInteger(session.playbackTabId)) return false;
+  const since = Number(session.phaseStartedAt ?? session.updatedAt ?? 0);
+  return now - since > PREPARE_STALL_TIMEOUT_MS;
+}
+
+// The retry gets a fresh stall window and marks itself as the pending recovery.
+// beginEpisode consumes that marker so its own re-entry cannot reset the bound.
+export function recordStallRecoveryAttempt(session) {
+  if (!session || isTerminal(session)) return session;
+  return copy(session, {
+    stallRecoveryAttempts: Number(session.stallRecoveryAttempts || 0) + 1,
+    stallRecoveryPending: true,
+    phaseStartedAt: Date.now()
+  });
 }
 
 export function beginEpisode(session, probe) {
@@ -70,6 +105,7 @@ export function beginEpisode(session, probe) {
   if (!probe?.supported || !probe?.episodeIdentity) {
     return block(session, "UNSUPPORTED_EPISODE_PAGE", probe?.diagnostics ?? []);
   }
+  const recoveringPrepare = Boolean(session.stallRecoveryPending);
   return copy(session, {
     state: SessionState.ARMING,
     playbackAuthority: PlaybackAuthority.NONE,
@@ -82,9 +118,13 @@ export function beginEpisode(session, probe) {
     playbackTabId: null,
     playbackDocument: null,
     pendingPermissionOrigin: null,
+    permissionBlockKind: null,
+    permissionResumeKey: null,
     blockedReason: null,
     transitionToken: null,
     playbackActivationAttempts: 0,
+    stallRecoveryAttempts: recoveringPrepare ? Number(session.stallRecoveryAttempts || 0) : 0,
+    stallRecoveryPending: false,
     diagnostics: probe.diagnostics ?? []
   });
 }
@@ -101,6 +141,8 @@ export function selectProvider(session, provider) {
     attemptedProviders,
     blockedReason: null,
     pendingPermissionOrigin: null,
+    permissionBlockKind: null,
+    permissionResumeKey: null,
     playbackActivationAttempts: 0,
     lastMedia: null
   });
@@ -119,6 +161,8 @@ export function recordProviderFailure(session, reason, payload = null) {
     state: SessionState.ARMING,
     blockedReason: null,
     pendingPermissionOrigin: null,
+    permissionBlockKind: null,
+    permissionResumeKey: null,
     playbackActivationAttempts: 0,
     providerFailures: [...(session.providerFailures ?? []), failure]
   });
@@ -149,6 +193,7 @@ export function markPlaybackSurfaceLost(session, reason = "PLAYBACK_SURFACE_CLOS
     playbackAuthority: session.playbackAuthority === PlaybackAuthority.CAST
       ? PlaybackAuthority.CAST
       : PlaybackAuthority.NONE,
+    permissionResumeKey: null,
     blockedReason: String(reason || "PLAYBACK_SURFACE_CLOSED")
   });
 }
@@ -192,6 +237,39 @@ export function clearCastRelay(session, relayState = null) {
   });
 }
 
+// True only while the D-028 opaque relay is actually transferring. In that
+// window the retiring sender is the sole transfer surface: a helper observing
+// the same receiver must not become a second success producer.
+export function isRetainedCastRelayInFlight(session) {
+  return Boolean(
+    session &&
+    session.cast?.relayState === "TRANSFERRING" &&
+    Number.isInteger(session.retiringPlaybackTabId)
+  );
+}
+
+// A terminal Cast failure means the retained receiver identity is dead. Clear it
+// so the next episode starts from local playback instead of retrying the same
+// session forever. Successful relay/promote paths never call this.
+export function clearRetainedCast(session) {
+  if (!session) return session;
+  return copy(session, {
+    cast: {
+      ...(session.cast ?? {}),
+      connected: false,
+      sticky: false,
+      sessionId: null,
+      deviceName: null,
+      receiverApplicationId: null,
+      mediaPlayerState: null,
+      mediaIdleReason: null,
+      relayToken: null,
+      relayState: null,
+      updatedAt: Date.now()
+    }
+  });
+}
+
 export function promoteRetiringPlaybackSurface(session, playbackDocument = null) {
   if (!session || !Number.isInteger(session.retiringPlaybackTabId)) return session;
   return copy(session, {
@@ -209,19 +287,30 @@ export function promoteRetiringPlaybackSurface(session, playbackDocument = null)
 }
 
 export function requireProviderPermission(session, origin, document = null) {
+  const previouslyGranted = Boolean(
+    session.lastGrantedPermissionOrigin &&
+    session.lastGrantedPermissionOrigin === origin
+  );
   return copy(session, {
     state: SessionState.BLOCKED,
     blockedReason: "PROVIDER_PERMISSION_REQUIRED",
     pendingPermissionOrigin: origin,
+    permissionBlockKind: previouslyGranted ? "PREVIOUSLY_GRANTED" : "NEW_ORIGIN",
     playbackDocument: document ?? session.playbackDocument
   });
 }
 
-export function markProviderAttached(session) {
+export function markProviderAttached(session, origin = null) {
   return copy(session, {
     state: SessionState.ARMING,
     blockedReason: null,
-    pendingPermissionOrigin: null
+    pendingPermissionOrigin: null,
+    permissionBlockKind: null,
+    permissionResumeKey: null,
+    // Record the attached document's origin even when it was already granted
+    // (for example a manifest host), so a later denial is diagnosed as a lost
+    // grant rather than a brand-new origin.
+    lastGrantedPermissionOrigin: origin ?? session.pendingPermissionOrigin ?? session.lastGrantedPermissionOrigin ?? null
   });
 }
 
@@ -230,6 +319,11 @@ export function block(session, reason, diagnostics = null) {
   return copy(session, {
     state: SessionState.BLOCKED,
     blockedReason: reason,
+    // A different block reason starts a new block transition; the permission
+    // auto-resume bound must not leak into it.
+    permissionResumeKey: reason === "PROVIDER_PERMISSION_REQUIRED"
+      ? (session.permissionResumeKey ?? null)
+      : null,
     diagnostics: diagnostics ?? session.diagnostics
   });
 }
@@ -243,6 +337,9 @@ export function stop(session) {
     transitionToken: null,
     blockedReason: null,
     pendingPermissionOrigin: null,
+    permissionBlockKind: null,
+    permissionResumeKey: null,
+    stallRecoveryPending: false,
     playbackTabId: null,
     retiringPlaybackTabId: null,
     retiringPlaybackProvider: null,
@@ -332,6 +429,22 @@ export function recordPlaybackActivationAttempt(session) {
 
 export function recordMedia(session, type, payload = {}) {
   if (!session || isTerminal(session)) return { session, action: null };
+
+  // During the D-028 retained-sender relay, only CAST_RELAY_PLAYING from the
+  // retiring sender may prove the new remote episode. A helper page can observe
+  // the same Cast session and emit GoogleCast MEDIA_PLAYING, but accepting that
+  // as a second success path races the canonical relay/promotion transaction.
+  if (
+    type === "MEDIA_PLAYING" &&
+    payload.playerKind === "GoogleCast" &&
+    !payload.relayTransfer &&
+    isRetainedCastRelayInFlight(session)
+  ) {
+    return {
+      session: copy(session, { lastMedia: { type, payload, at: Date.now() } }),
+      action: null
+    };
+  }
 
   const remoteCastOwnsPlayback =
     session.playbackAuthority === PlaybackAuthority.CAST &&

@@ -27,7 +27,11 @@ const state = {
   castRelayPromoteMessages: [],
   castRelayFailureMessages: [],
   castRemoteControlMessages: [],
-  pausedSessionWrite: null
+  pausedSessionWrite: null,
+  pausedSessionWriteMatch: null,
+  pausedProviderInjection: null,
+  pausedPlaybackDocumentPoll: null,
+  accessDeniedOnProviderInjection: false
 };
 
 const probe = {
@@ -78,6 +82,10 @@ function reset(overrides = {}) {
   state.castRelayFailureMessages = [];
   state.castRemoteControlMessages = [];
   state.pausedSessionWrite = null;
+  state.pausedSessionWriteMatch = null;
+  state.pausedProviderInjection = null;
+  state.pausedPlaybackDocumentPoll = null;
+  state.accessDeniedOnProviderInjection = false;
   Object.assign(state, overrides);
 }
 
@@ -91,6 +99,12 @@ globalThis.chrome = {
           state.pausedSessionWrite = null;
           paused.entered();
           await paused.release;
+        }
+        const match = state.pausedSessionWriteMatch;
+        if (match && match.predicate(values["qec.session"])) {
+          state.pausedSessionWriteMatch = null;
+          match.entered();
+          await match.release;
         }
         Object.assign(state.storage, values);
       },
@@ -124,11 +138,22 @@ globalThis.chrome = {
   scripting: {
     async executeScript(details) {
       state.injections.push(structuredClone(details));
-      if (details.files?.includes("src/providers/frame-agent.js") && state.originShiftOnProviderInjection) {
-        state.currentPlaybackUrl = state.originShiftOnProviderInjection;
-        state.currentPlaybackDocumentId = "doc-shifted";
-        state.originShiftOnProviderInjection = null;
-        throw new Error("Cannot access contents of the page. Extension manifest must request permission to access the respective host.");
+      if (details.files?.includes("src/providers/frame-agent.js")) {
+        if (state.accessDeniedOnProviderInjection) {
+          throw new Error("Cannot access contents of the page. Extension manifest must request permission to access the respective host.");
+        }
+        if (state.originShiftOnProviderInjection) {
+          state.currentPlaybackUrl = state.originShiftOnProviderInjection;
+          state.currentPlaybackDocumentId = "doc-shifted";
+          state.originShiftOnProviderInjection = null;
+          throw new Error("Cannot access contents of the page. Extension manifest must request permission to access the respective host.");
+        }
+        if (state.pausedProviderInjection) {
+          const paused = state.pausedProviderInjection;
+          state.pausedProviderInjection = null;
+          paused.entered();
+          await paused.release;
+        }
       }
       return [];
     }
@@ -136,6 +161,12 @@ globalThis.chrome = {
   webNavigation: {
     async getFrame({ tabId, frameId }) {
       assert.equal(frameId, 0);
+      if (state.pausedPlaybackDocumentPoll && state.pausedPlaybackDocumentPoll.tabId === tabId) {
+        const paused = state.pausedPlaybackDocumentPoll;
+        state.pausedPlaybackDocumentPoll = null;
+        paused.entered();
+        await paused.release;
+      }
       const created = state.createdTabs.some((tab) => tab.id === tabId);
       if (!created) return null;
       return {
@@ -223,6 +254,23 @@ function dispatch(msg, sender = {}) {
       resolve(undefined);
     }
   });
+}
+
+async function waitFor(predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error("waitFor timeout");
+}
+
+function deferredGate() {
+  let entered;
+  let release;
+  const reached = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  return { entered, release, reached, gate };
 }
 
 test("controller tab stays open while a temporary playback tab handles media and episode progression", async () => {
@@ -398,6 +446,21 @@ test("retained Cast sender receives the next JW item transiently and becomes can
   assert.match(transferId, /:2:cast-relay$/);
   assert.equal(JSON.stringify(state.storage).includes("media.example.invalid"), false, "opaque media details must never be persisted");
   assert.equal(state.storage["qec.session"].cast.relayState, "TRANSFERRING");
+
+  // The helper can observe the same Cast receiver while the retiring sender is
+  // performing D-028. That observation is not a second handoff success path and
+  // must not close/promote either surface.
+  await dispatch(message("MEDIA_PLAYING", {
+    playerKind: "GoogleCast",
+    mediaPlayerState: "PLAYING"
+  }, persisted.sessionId, persisted.epoch), { tab: { id: 31 }, frameId: 0 });
+  persisted = state.storage["qec.session"];
+  assert.equal(persisted.state, "ARMING");
+  assert.equal(persisted.playbackAuthority, "NONE");
+  assert.equal(persisted.playbackTabId, 31);
+  assert.equal(persisted.retiringPlaybackTabId, 30);
+  assert.equal(persisted.cast.relayState, "TRANSFERRING");
+  assert.deepEqual(state.removedTabs, [], "helper-side Cast observation must not race the retained sender");
 
   await dispatch(message("CAST_RELAY_PLAYING", {
     transferId,
@@ -1207,5 +1270,555 @@ test("Chromecast button uses provider-owned Cast controls and rejects unavailabl
   assert.equal(connected.ok, false);
   assert.equal(connected.error, "CAST_ALREADY_CONNECTED");
   assert.equal(state.debuggerAttaches.length, 1);
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("terminal Cast relay failure clears the retained identity so the next episode attaches locally", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE", "Doodstream"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", {
+    available: true, connected: true, sessionId: "cast-123", deviceName: "Seb",
+    receiverApplicationId: "CC1AD845", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+  state.tabUpdatedListener(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  let session = state.storage["qec.session"];
+  assert.equal(session.playbackTabId, 31);
+  assert.equal(session.retiringPlaybackTabId, 30);
+  assert.equal(state.attachMessages.at(-1).message.payload.castSessionId, "cast-123");
+
+  await dispatch(message("CAST_RELAY_ITEM", { item: { title: "Episode 2", sources: [] } },
+    session.sessionId, session.epoch), { tab: { id: 31 }, frameId: 0 });
+  const transferId = state.castRelayApplyMessages.at(-1).message.payload.transferId;
+
+  await dispatch(message("CAST_RELAY_FAILED", {
+    transferId, reason: "JW_CAST_RELAY_REJECTED"
+  }, session.sessionId, session.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  session = state.storage["qec.session"];
+  assert.equal(session.cast.sticky, false);
+  assert.equal(session.cast.connected, false);
+  assert.equal(session.cast.sessionId, null);
+  assert.equal(session.cast.receiverApplicationId, null);
+  assert.equal(session.cast.relayToken, null);
+
+  // The helper falls back to local playback; the dead sender is then released.
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "HTML5", paused: false, readyState: 4 },
+    session.sessionId, session.epoch), { tab: { id: 31 }, frameId: 0 });
+  session = state.storage["qec.session"];
+  assert.equal(session.state, "RUNNING");
+  assert.equal(session.playbackAuthority, "LOCAL_PLAYER");
+  assert.equal(session.retiringPlaybackTabId, null);
+  assert.ok(state.removedTabs.includes(30));
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" },
+    nextEpisode: { ...probe.nextEpisode, episode: 4, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-4" }
+  };
+  await dispatch(message("MEDIA_ENDED", { playerKind: "HTML5" }, session.sessionId, session.epoch),
+    { tab: { id: 31 }, frameId: 0 });
+  state.tabUpdatedListener(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  const attach = state.attachMessages.at(-1).message.payload;
+  assert.equal(attach.castSessionId, null);
+  assert.equal(attach.castRelayMode, false);
+  assert.equal(state.storage["qec.session"].playbackTabId, 32);
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("Stop during a permission grant cannot resurrect the ended session", async () => {
+  reset();
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  state.grantedOrigins.add("https://voe.sx/*");
+
+  const gate = deferredGate();
+  state.pausedProviderInjection = { entered: gate.entered, release: gate.gate };
+
+  const grant = dispatch(message("POPUP_PERMISSION_GRANTED", { origin: "https://voe.sx" }));
+  await gate.reached;
+  const stopped = await dispatch(message("POPUP_STOP"));
+  assert.equal(stopped.status.state, "STOPPED");
+  gate.release();
+  await grant;
+
+  const session = state.storage["qec.session"];
+  assert.equal(session.lifecycle, "ENDED");
+  assert.equal(session.state, "STOPPED");
+  assert.equal(session.playbackTabId, null);
+  assert.equal(state.createdTabs.length, 1);
+});
+
+test("a Cast status written during permission attach survives the attach save", async () => {
+  reset();
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  state.grantedOrigins.add("https://voe.sx/*");
+
+  const gate = deferredGate();
+  state.pausedProviderInjection = { entered: gate.entered, release: gate.gate };
+
+  const grant = dispatch(message("POPUP_PERMISSION_GRANTED", { origin: "https://voe.sx" }));
+  await gate.reached;
+
+  await dispatch(message("CAST_STATUS", {
+    available: true, connected: true, sessionId: "cast-123", deviceName: "Seb",
+    receiverApplicationId: "CC1AD845", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  assert.equal(state.storage["qec.session"].cast.sessionId, "cast-123");
+
+  gate.release();
+  await grant;
+
+  const session = state.storage["qec.session"];
+  assert.equal(session.state, "ARMING");
+  assert.equal(session.cast.connected, true);
+  assert.equal(session.cast.sticky, true);
+  assert.equal(session.cast.sessionId, "cast-123");
+  assert.equal(session.cast.receiverApplicationId, "CC1AD845");
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("a stalled prepare gets exactly one automatic retry and then blocks", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.state, "ARMING");
+  assert.equal(started.status.playbackTabId, 30);
+
+  let session = state.storage["qec.session"];
+  state.storage["qec.session"] = {
+    ...session,
+    playbackTabId: null,
+    playbackDocument: null,
+    phaseStartedAt: Date.now() - 31000
+  };
+
+  const first = await dispatch(message("POPUP_GET_STATUS"));
+  assert.equal(first.status.state, "ARMING");
+  assert.equal(state.storage["qec.session"].stallRecoveryAttempts, 1);
+
+  await waitFor(() => state.attachMessages.length === 2);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  session = state.storage["qec.session"];
+  assert.equal(session.stallRecoveryAttempts, 1, "the retry's own beginEpisode must not reset the bound");
+  assert.equal(session.epoch, 2);
+  assert.equal(session.playbackTabId, 31);
+  assert.equal(state.createdTabs.length, 2);
+
+  state.storage["qec.session"] = {
+    ...session,
+    playbackTabId: null,
+    playbackDocument: null,
+    phaseStartedAt: Date.now() - 31000
+  };
+
+  const second = await dispatch(message("POPUP_GET_STATUS"));
+  assert.equal(second.status.state, "BLOCKED");
+  assert.equal(second.status.blockedReason, "PREPARE_STALLED");
+  assert.equal(state.storage["qec.session"].stallRecoveryAttempts, 1);
+  assert.equal(state.createdTabs.length, 2, "a second stall must not start another prepare");
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("GET_STATUS never disturbs an in-flight prepare navigation", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+  await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+
+  const session = state.storage["qec.session"];
+  state.storage["qec.session"] = {
+    ...session,
+    state: "NAVIGATING",
+    playbackTabId: null,
+    playbackDocument: null,
+    phaseStartedAt: Date.now() - 31000,
+    nextEpisode: probe.nextEpisode
+  };
+
+  const gate = deferredGate();
+  state.pausedProviderInjection = { entered: gate.entered, release: gate.gate };
+
+  state.tabUpdatedListener(10, { status: "complete" });
+  await gate.reached;
+
+  // A worker-like stall signature appears while the prepare is still running.
+  state.storage["qec.session"] = {
+    ...state.storage["qec.session"],
+    state: "ARMING",
+    playbackTabId: null,
+    playbackDocument: null,
+    phaseStartedAt: Date.now() - 31000
+  };
+
+  const status = await dispatch(message("POPUP_GET_STATUS"));
+  assert.equal(state.storage["qec.session"].stallRecoveryAttempts, 0,
+    "an in-flight prepare must not be treated as a stall");
+  assert.equal(state.tabUpdates.some((entry) => entry.tabId === 10), false,
+    "GET_STATUS must not re-issue controller navigation while prepare is running");
+  assert.equal(status.status.state, "ARMING");
+
+  gate.release();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("GET_STATUS auto-resumes a permission block that is now granted without duplicate attach", async () => {
+  reset();
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  assert.equal(started.status.permissionBlockKind, "NEW_ORIGIN");
+  state.grantedOrigins.add("https://voe.sx/*");
+
+  const [first, second] = await Promise.all([
+    dispatch(message("POPUP_GET_STATUS")),
+    dispatch(message("POPUP_GET_STATUS"))
+  ]);
+  assert.equal(first.status.state, "ARMING");
+  assert.equal(second.status.state, "ARMING");
+  assert.equal(state.attachMessages.length, 1, "concurrent status polls must resume the grant once");
+  assert.equal(state.createdTabs.length, 1);
+  assert.equal(state.storage["qec.session"].lastGrantedPermissionOrigin, "https://voe.sx");
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("access-denied provider injection is a permission boundary, not a provider failure", async () => {
+  reset({
+    grantedOrigins: new Set(["https://voe.sx/*"]),
+    accessDeniedOnProviderInjection: true
+  });
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false,
+    providerPriority: ["VOE", "Doodstream"],
+    providerFailoverEnabled: true
+  }));
+
+  assert.equal(started.status.state, "BLOCKED");
+  assert.equal(started.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  assert.equal(started.status.pendingPermissionOrigin, "https://voe.sx");
+  assert.equal(state.storage["qec.session"].providerFailures.length, 0);
+  assert.equal(state.createdTabs.length, 1, "permission recovery must not fail over to another provider");
+  assert.equal(state.storage["qec.session"].playbackTabId, 30);
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("sender-tab closure during a pending Cast relay clears the retained identity", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE", "Doodstream"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", {
+    available: true, connected: true, sessionId: "cast-123", deviceName: "Seb",
+    receiverApplicationId: "CC1AD845", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+  state.tabUpdatedListener(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  let session = state.storage["qec.session"];
+  assert.equal(session.playbackTabId, 31);
+  assert.equal(session.retiringPlaybackTabId, 30);
+
+  await dispatch(message("CAST_RELAY_ITEM", { item: { title: "Episode 2", sources: [] } },
+    session.sessionId, session.epoch), { tab: { id: 31 }, frameId: 0 });
+  assert.ok(state.storage["qec.session"].cast.relayToken, "the relay is delivered but not yet remote-playing");
+
+  // The retained sender closes after delivery but before remote PLAYING.
+  state.tabRemovedListener(30);
+  await waitFor(() => state.storage["qec.session"].retiringPlaybackTabId === null);
+
+  session = state.storage["qec.session"];
+  assert.equal(session.cast.sticky, false);
+  assert.equal(session.cast.sessionId, null);
+  assert.equal(session.cast.receiverApplicationId, null);
+
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "HTML5", paused: false, readyState: 4 },
+    session.sessionId, session.epoch), { tab: { id: 31 }, frameId: 0 });
+  session = state.storage["qec.session"];
+  assert.equal(session.state, "RUNNING");
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" },
+    nextEpisode: { ...probe.nextEpisode, episode: 4, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-4" }
+  };
+  await dispatch(message("MEDIA_ENDED", { playerKind: "HTML5" }, session.sessionId, session.epoch),
+    { tab: { id: 31 }, frameId: 0 });
+  state.tabUpdatedListener(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  const attach = state.attachMessages.at(-1).message.payload;
+  assert.equal(attach.castSessionId, null);
+  assert.equal(attach.castRelayMode, false);
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("closing the retiring sender during helper navigation cannot resurrect its tab id", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE", "Doodstream"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("CAST_STATUS", {
+    available: true, connected: true, sessionId: "cast-123", deviceName: "Seb",
+    receiverApplicationId: "CC1AD845", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "GoogleCast" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+
+  const gate = deferredGate();
+  state.pausedPlaybackDocumentPoll = { tabId: 31, entered: gate.entered, release: gate.gate };
+
+  state.tabUpdatedListener(10, { status: "complete" });
+  await gate.reached;
+
+  // The sender closes while the helper document is still settling.
+  state.tabRemovedListener(30);
+  await waitFor(() => state.storage["qec.session"].retiringPlaybackTabId === null);
+
+  gate.release();
+  await waitFor(() => state.attachMessages.length === 2);
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  const session = state.storage["qec.session"];
+  assert.equal(session.retiringPlaybackTabId, null,
+    "the stale navigation save must not restore a closed sender");
+  assert.equal(state.attachMessages.at(-1).message.payload.castRelayMode, false);
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("Stop during the post-navigation save cannot be overwritten by the stale write", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "JWPlayer" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+
+  const gate = deferredGate();
+  state.pausedSessionWriteMatch = {
+    predicate: (session) => session?.playbackTabId === 31 &&
+      session?.playbackDocument?.origin === "https://voe.sx",
+    entered: gate.entered,
+    release: gate.gate
+  };
+
+  state.tabUpdatedListener(10, { status: "complete" });
+  await gate.reached;
+
+  const stopPromise = dispatch(message("POPUP_STOP"));
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  gate.release();
+  const stopped = await stopPromise;
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(stopped.status.lifecycle, "ENDED");
+  const session = state.storage["qec.session"];
+  assert.equal(session.lifecycle, "ENDED");
+  assert.equal(session.state, "STOPPED");
+  assert.equal(session.playbackTabId, null);
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("a persistent access denial gets exactly one automatic permission resume", async () => {
+  reset();
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  state.grantedOrigins.add("https://voe.sx/*");
+  state.accessDeniedOnProviderInjection = true;
+
+  const first = await dispatch(message("POPUP_GET_STATUS"));
+  assert.equal(first.status.state, "BLOCKED");
+  assert.equal(first.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  const frameAgentInjections = () => state.injections.filter((entry) =>
+    entry.files?.includes("src/providers/frame-agent.js")).length;
+  assert.equal(frameAgentInjections(), 1);
+  assert.equal(state.tabUpdates.filter((entry) => entry.tabId === 30 && entry.active === true).length, 1);
+
+  const second = await dispatch(message("POPUP_GET_STATUS"));
+  const third = await dispatch(message("POPUP_GET_STATUS"));
+  assert.equal(second.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  assert.equal(third.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  assert.equal(frameAgentInjections(), 1,
+    "a persistent access denial must not re-run provider injection on every poll");
+  assert.equal(state.tabUpdates.filter((entry) => entry.tabId === 30 && entry.active === true).length, 1,
+    "a persistent access denial must not re-activate the tab on every poll");
+  assert.equal(state.storage["qec.session"].permissionBlockKind, "PREVIOUSLY_GRANTED");
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("a normal attach records the origin so a later denial is diagnosed as a lost grant", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.state, "ARMING");
+  assert.equal(state.storage["qec.session"].lastGrantedPermissionOrigin, "https://voe.sx");
+
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "JWPlayer" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+  state.accessDeniedOnProviderInjection = true;
+  state.tabUpdatedListener(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  const session = state.storage["qec.session"];
+  assert.equal(session.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  assert.equal(session.pendingPermissionOrigin, "https://voe.sx");
+  assert.equal(session.permissionBlockKind, "PREVIOUSLY_GRANTED");
+  assert.equal(session.lastGrantedPermissionOrigin, "https://voe.sx");
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("a Cast status between attach load and save survives the attach save", async () => {
+  reset();
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  state.grantedOrigins.add("https://voe.sx/*");
+
+  const gate = deferredGate();
+  state.pausedSessionWriteMatch = {
+    predicate: (session) => session?.state === "ARMING" &&
+      session?.playbackTabId === 30 &&
+      session?.lastGrantedPermissionOrigin === "https://voe.sx" &&
+      session?.cast?.connected === false,
+    entered: gate.entered,
+    release: gate.gate
+  };
+
+  const grant = dispatch(message("POPUP_PERMISSION_GRANTED", { origin: "https://voe.sx" }));
+  await gate.reached;
+
+  const cast = dispatch(message("CAST_STATUS", {
+    available: true, connected: true, sessionId: "cast-live", deviceName: "Seb",
+    receiverApplicationId: "CC1AD845", mediaPlayerState: "PLAYING"
+  }, started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  // The Cast write must queue behind the paused attach save, not overwrite it.
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  gate.release();
+  await cast;
+  await grant;
+
+  const session = state.storage["qec.session"];
+  assert.equal(session.state, "ARMING");
+  assert.equal(session.cast.connected, true);
+  assert.equal(session.cast.sticky, true);
+  assert.equal(session.cast.sessionId, "cast-live");
+  await dispatch(message("POPUP_STOP"));
+});
+
+test("concurrent GET_STATUS and permission grant attach exactly once", async () => {
+  reset({ grantedOrigins: new Set(["https://voe.sx/*"]) });
+
+  // Reach a PREVIOUSLY_GRANTED block first. The concurrent popup grant below
+  // fails the same way, so the auto-resume's resume key still matches and a
+  // missing shared marker would let it start a second attach.
+  const started = await dispatch(message("POPUP_START", {
+    tabId: 10, windowId: 20, fullscreen: false, providerPriority: ["VOE"]
+  }));
+  assert.equal(started.status.state, "ARMING");
+  await dispatch(message("MEDIA_PLAYING", { playerKind: "JWPlayer", state: "playing" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+  await dispatch(message("MEDIA_ENDED", { playerKind: "JWPlayer" },
+    started.status.sessionId, started.status.epoch), { tab: { id: 30 }, frameId: 0 });
+
+  state.currentProbe = {
+    ...probe,
+    episodeIdentity: { ...probe.episodeIdentity, episode: 2, url: probe.nextEpisode.url },
+    nextEpisode: { ...probe.nextEpisode, episode: 3, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-3" }
+  };
+  state.accessDeniedOnProviderInjection = true;
+  state.tabUpdatedListener(10, { status: "complete" });
+  await new Promise((resolve) => setTimeout(resolve, 550));
+
+  const blocked = state.storage["qec.session"];
+  assert.equal(blocked.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  assert.equal(blocked.permissionBlockKind, "PREVIOUSLY_GRANTED");
+  assert.equal(blocked.permissionResumeKey, null);
+
+  const injectionsBefore = state.injections.filter((entry) =>
+    entry.files?.includes("src/providers/frame-agent.js")).length;
+  const activationsBefore = state.tabUpdates.filter((entry) =>
+    entry.tabId === blocked.playbackTabId && entry.active === true).length;
+
+  const [status, granted] = await Promise.all([
+    dispatch(message("POPUP_GET_STATUS")),
+    dispatch(message("POPUP_PERMISSION_GRANTED", { origin: "https://voe.sx" }))
+  ]);
+
+  const injectionsAfter = state.injections.filter((entry) =>
+    entry.files?.includes("src/providers/frame-agent.js")).length;
+  const activationsAfter = state.tabUpdates.filter((entry) =>
+    entry.tabId === blocked.playbackTabId && entry.active === true).length;
+  assert.equal(injectionsAfter - injectionsBefore, 1,
+    "the popup grant and auto-resume must share one attach");
+  assert.equal(activationsAfter - activationsBefore, 1,
+    "the popup grant and auto-resume must activate the tab once");
+  assert.equal(status.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
+  assert.equal(granted.status.blockedReason, "PROVIDER_PERMISSION_REQUIRED");
   await dispatch(message("POPUP_STOP"));
 });

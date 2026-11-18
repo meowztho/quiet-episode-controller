@@ -1,23 +1,34 @@
 from pathlib import Path
-import os
 import shutil
 import subprocess
 import sys
 import tempfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from browser_path import describe_failure, find_browser
+
 ROOT = Path(__file__).resolve().parents[1]
-CHROMIUM = os.environ.get("CHROMIUM") or shutil.which("chromium") or shutil.which("chromium-browser")
+CHROMIUM = find_browser()
 
 if not CHROMIUM:
     print("EXTENSION PACKAGE VALIDATION: INCONCLUSIVE - Chromium not found")
+    print(describe_failure())
     raise SystemExit(2)
+
+print(f"EXTENSION PACKAGE VALIDATION: browser {CHROMIUM}")
 
 with tempfile.TemporaryDirectory(prefix="qec-pack-") as td:
     temp_root = Path(td)
     extension = temp_root / "extension"
     extension.mkdir()
     shutil.copy2(ROOT / "manifest.json", extension / "manifest.json")
-    shutil.copytree(ROOT / "src", extension / "src", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # Package exactly what build_release.py ships.
+    shutil.copytree(
+        ROOT / "src",
+        extension / "src",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
     result = subprocess.run(
         [CHROMIUM, "--no-sandbox", f"--pack-extension={extension}"],
         capture_output=True,

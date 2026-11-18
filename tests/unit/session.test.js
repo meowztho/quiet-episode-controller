@@ -2,14 +2,19 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   acceptMessage,
+  beginCastRelay,
   beginEpisode,
+  clearRetainedCast,
   createSession,
+  isPrepareStalled,
   isSessionActive,
   markPlaybackSurfaceLost,
   markProviderAttached,
   recordCastStatus,
   recordMedia,
   recordProviderFailure,
+  recordStallRecoveryAttempt,
+  requireProviderPermission,
   retirePlaybackSurface,
   selectProvider,
   setPlaybackTab,
@@ -248,6 +253,39 @@ test("unexpected playback-surface loss blocks but does not end the global sessio
   assert.equal(session.playbackAuthority, PlaybackAuthority.CAST);
 });
 
+test("retained JW relay ignores helper-side GoogleCast playback until the retiring sender proves relay success", () => {
+  let session = runningSession();
+  session = recordCastStatus(session, {
+    connected: true,
+    sessionId: "cast-123",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  });
+  session = retirePlaybackSurface(session);
+  session = beginEpisode(session, {
+    supported: true,
+    episodeIdentity: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 2, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-2" },
+    nextEpisode: null,
+    diagnostics: []
+  });
+  session = setPlaybackTab(session, 31);
+  session = beginCastRelay(session, "relay-2");
+
+  const stray = recordMedia(session, "MEDIA_PLAYING", { playerKind: "GoogleCast", mediaPlayerState: "PLAYING" });
+  assert.equal(stray.session.state, SessionState.ARMING);
+  assert.equal(stray.session.playbackAuthority, PlaybackAuthority.NONE);
+  assert.equal(stray.session.retiringPlaybackTabId, 30);
+  assert.equal(stray.session.cast.relayState, "TRANSFERRING");
+
+  const proven = recordMedia(stray.session, "MEDIA_PLAYING", {
+    playerKind: "GoogleCast",
+    mediaPlayerState: "PLAYING",
+    relayTransfer: true
+  });
+  assert.equal(proven.session.state, SessionState.RUNNING);
+  assert.equal(proven.session.playbackAuthority, PlaybackAuthority.CAST);
+});
+
 test("remote Cast authority ignores unrelated local JW playback failures until Cast becomes idle", () => {
   let session = runningSession();
   session = recordCastStatus(session, {
@@ -333,4 +371,82 @@ test("stop and natural completion end the global lifecycle", () => {
   assert.equal(completed.state, SessionState.COMPLETED);
   assert.equal(completed.lifecycle, SessionLifecycle.ENDED);
   assert.equal(isSessionActive(completed), false);
+});
+
+test("clearing a retained Cast identity leaves the input session untouched", () => {
+  let session = createSession({ sessionId: "s1", tabId: 10, windowId: 20 });
+  session = recordCastStatus(session, {
+    available: true,
+    connected: true,
+    sessionId: "cast-123",
+    deviceName: "Seb",
+    receiverApplicationId: "CC1AD845",
+    mediaPlayerState: "PLAYING"
+  });
+  session = beginCastRelay(session, "relay-token");
+
+  const cleared = clearRetainedCast(session);
+  assert.equal(session.cast.sticky, true);
+  assert.equal(session.cast.sessionId, "cast-123");
+  assert.equal(session.cast.relayToken, "relay-token");
+
+  assert.notEqual(cleared, session);
+  assert.equal(cleared.cast.connected, false);
+  assert.equal(cleared.cast.sticky, false);
+  assert.equal(cleared.cast.sessionId, null);
+  assert.equal(cleared.cast.deviceName, null);
+  assert.equal(cleared.cast.receiverApplicationId, null);
+  assert.equal(cleared.cast.relayToken, null);
+  assert.equal(cleared.cast.relayState, null);
+});
+
+test("permission blocks distinguish a new origin from a lost prior grant", () => {
+  let session = createSession({ sessionId: "s1", tabId: 10, windowId: 20 });
+  session = requireProviderPermission(session, "https://voe.sx");
+  assert.equal(session.permissionBlockKind, "NEW_ORIGIN");
+  assert.equal(session.lastGrantedPermissionOrigin, null);
+
+  session = markProviderAttached(session);
+  assert.equal(session.permissionBlockKind, null);
+  assert.equal(session.lastGrantedPermissionOrigin, "https://voe.sx");
+
+  session = requireProviderPermission(session, "https://voe.sx");
+  assert.equal(session.permissionBlockKind, "PREVIOUSLY_GRANTED");
+
+  session = markProviderAttached(session);
+  session = requireProviderPermission(session, "https://playmogo.com");
+  assert.equal(session.permissionBlockKind, "NEW_ORIGIN");
+});
+
+test("prepare stall recovery is bounded to one retry per episode", () => {
+  const firstProbe = {
+    supported: true,
+    episodeIdentity: { site: "aniworld", seriesSlug: "black-torch", season: 1, episode: 1, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-1" },
+    nextEpisode: null,
+    diagnostics: []
+  };
+  let session = createSession({ sessionId: "s1", tabId: 10, windowId: 20 });
+  session = beginEpisode(session, firstProbe);
+  session = setPlaybackTab(session, null);
+
+  const stalled = { ...session, phaseStartedAt: Date.now() - 31000 };
+  assert.equal(isPrepareStalled(stalled), true);
+  assert.equal(isPrepareStalled({ ...stalled, playbackTabId: 30 }), false);
+  assert.equal(isPrepareStalled({ ...stalled, state: SessionState.RUNNING }), false);
+  assert.equal(isPrepareStalled({ ...stalled, lifecycle: SessionLifecycle.ENDED }), false);
+
+  let retry = recordStallRecoveryAttempt(stalled);
+  assert.equal(retry.stallRecoveryAttempts, 1);
+  assert.equal(isPrepareStalled(retry), false, "the retry gets a fresh stall window");
+
+  retry = beginEpisode(retry, firstProbe);
+  assert.equal(retry.stallRecoveryAttempts, 1, "the retry's own episode entry must not reset the bound");
+  assert.equal(retry.stallRecoveryPending, false);
+
+  const nextProbe = {
+    ...firstProbe,
+    episodeIdentity: { ...firstProbe.episodeIdentity, episode: 2, url: "https://aniworld.to/anime/stream/black-torch/staffel-1/episode-2" }
+  };
+  const next = beginEpisode(retry, nextProbe);
+  assert.equal(next.stallRecoveryAttempts, 0, "a genuinely new episode gets a fresh bound");
 });

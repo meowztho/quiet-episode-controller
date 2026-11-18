@@ -17,6 +17,71 @@ It keeps the supported episode site open as a controller, opens the selected vid
 - Project architecture, acceptance evidence, tests, and agent handoff material are versioned with the source.
 
 
+## v0.6.1 single Cast relay path (2026-11-17)
+
+v0.6.0 was the pre-port test build. Live testing on it reproduced the
+`CAST_RELAY_DELIVERED → TRUSTED_JW_CAST_CONTROL` sequence described by the
+unmerged `bb19450` commit: a Cast picker opened and episode progression stopped.
+v0.6.1 ports that fix (`driveStickyCastContinuation`,
+`isRetainedCastRelayInFlight`), removes the three non-project modules, and pins
+the extension ID. The section below describes the combined candidate.
+
+## v0.6.0 stability release candidate: background Cast rollover (2026-11-16)
+
+User reports for this release: about 90% reliability with hiccups after one or
+two episodes, access prompts that appeared to reset, and Chromecast rollover
+that only worked while the browser window was in the foreground. Four
+independent audits and three verification rounds traced these to state and
+ordering defects rather than to provider behaviour.
+
+Fixed:
+
+- **Retained Cast identity was a one-way latch.** One failed rollover kept the
+  dead receiver identity forever, so every later episode waited on a six-second
+  rejoin against a session that no longer existed. The identity is now cleared on
+  every terminal Cast failure and when the retiring sender closes during a relay,
+  while a successful relay still retains it.
+- **Session writes could overwrite each other.** Live Cast status, attach saves
+  and Stop used separate ordering mechanisms. Every session read-modify-save now
+  runs through one queue, so a live Cast status survives an attach save and Stop
+  cannot be resurrected by a stale write.
+- **A lost prepare left the session stuck.** `GET_STATUS` now detects a
+  NAVIGATING/ARMING session with no playback tab for 30 seconds, retries once per
+  episode, and then blocks with a visible reason instead of staying silent.
+- **Cast end detection needed a foreground page.** The live sender exposes only
+  the legacy Cast media object, so episode end depended on a 1 Hz page poll that
+  Chrome clamps to one wake-up per minute in a hidden tab. The retained media
+  object's own update listener now drives end detection, with the poll kept as
+  fallback. Relay mode no longer arms the six-second sender-closing fallback, and
+  a relay export that is temporarily unavailable is retried within a bound.
+- **Permission state was not diagnosable.** `GET_STATUS` now auto-resumes a
+  permission block once it is granted, the session records the last granted
+  origin, a lost grant is distinguished from a new redirect host, and a
+  site-access denial is reported as a permission boundary instead of a provider
+  failure. Chrome still requires the one click for a new origin; QEC cannot
+  grant silently.
+- **Recovered an unmerged Cast fix.** The single-relay-path commit `bb19450`
+  existed in the repository but was never on the released line. Live testing
+  reproduced the sequence it was written to prevent (`CAST_RELAY_DELIVERED`
+  followed by `TRUSTED_JW_CAST_CONTROL`, a Cast picker opening, progression
+  stopping). The fix is now ported: one strategy selector owns retained-Cast
+  continuation, and a helper cannot become a second success producer while the
+  D-028 relay is transferring.
+- **Release hygiene.** Removed dead protocol/storage exports, deduplicated the
+  session schema version, and deleted the three unreachable work-in-progress
+  modules plus the release-scope exclusion machinery they required. The static
+  gate is now Windows-path-safe, the npm scripts use a cross-platform Python
+  launcher, and browser discovery finds the installed Chrome/Edge, so
+  `npm run check` runs end to end on the development host. The manifest carries
+  a public `key`, pinning the extension ID so grants survive a moved checkout.
+
+Local evidence: 83/83 unit/orchestration tests, DOM and provider browser
+fixtures PASS, static ownership check PASS, extension package validation PASS,
+Project Gate PASS. Independent verification verdict: **ship with residual risk**.
+Live-device verification of backgrounded Chromecast rollover, real permission
+revocation, and long-paused memory behaviour is still outstanding and is not
+claimed as verified.
+
 ## v0.5.19 serialize Cast handoff state transitions (2026-10-13)
 
 User observed Chromecast continuing for three episodes, then a 0-second

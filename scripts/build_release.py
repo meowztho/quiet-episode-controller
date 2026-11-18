@@ -15,7 +15,11 @@ def build(output: Path) -> Path:
         stage = Path(td) / "quiet-episode-controller"
         stage.mkdir()
         shutil.copy2(ROOT / "manifest.json", stage / "manifest.json")
-        shutil.copytree(ROOT / "src", stage / "src", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        shutil.copytree(
+            ROOT / "src",
+            stage / "src",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         shutil.copy2(ROOT / "README.md", stage / "README.md")
         with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for path in sorted(stage.rglob("*")):

@@ -1004,5 +1004,51 @@
       "The controls remained available and functional after the automatic next-episode rollover, proving that the selected Cast-control driver survives the proven retained-sender episode transition.",
       "The observed result closes the v0.5.13 VOE remote-control visibility/control defect from v0.5.12; Doodstream retained-Cast rollover remains deferred and is not claimed as verified."
     ]
+  },
+  "v0_6_1_stability_release_candidate": {
+    "date": "2026-11-17",
+    "version": "0.6.1",
+    "supersedes": "0.6.0 pre-port test build",
+    "status": "LOCAL_VERIFIED_LIVE_PENDING",
+    "architecture": "No new owner, permission, host or Cast API surface. Session Core remains the single session writer; cast-main-bridge.js remains the single page-level Cast API owner; the D-028 relay contract and its opacity rules are unchanged.",
+    "defects_repaired": [
+      "Retained Cast identity was a one-way latch: after one terminal Cast failure every later episode attached with the dead session id and waited six seconds on a rejoin against a receiver that no longer existed. The identity is now cleared on terminal failure, relay failure, and retiring-sender closure during a relay, while a successful relay/promote still retains it.",
+      "Session writes used two independent ordering mechanisms. Live Cast status, attach saves and Stop now share one updateCurrentSession/withSessionWrite queue; the long provider-navigation wait stays outside the queue. A live Cast status survives an attach save and a stopped session cannot be resurrected by a stale save.",
+      "A lost or aborted prepare left the session in NAVIGATING/ARMING with Start disabled. GET_STATUS now detects a 30 s stall with no playback tab, retries at most once per episode, then blocks with an explicit reason.",
+      "Cast end detection depended on a 1 Hz page poll whose near-end window cannot be satisfied when hidden-tab throttling clamps timers to one wake-up per minute. The retained legacy chrome.cast.media.Media object's own update listener now drives inspect(), with the poll retained as fallback. Relay mode no longer arms the six-second sender-closing fallback, and a relay export reporting UNAVAILABLE is retried within a bound.",
+      "Permission recovery was invisible: GET_STATUS never re-checked the block, a lost grant was indistinguishable from a new redirect host, and an access-denied injection was misclassified as a provider failure. GET_STATUS now auto-resumes once per block transition with a persisted resume key, records the last granted origin, and classifies access denial as a permission boundary. chrome.permissions.request remains popup-gesture-only.",
+      "Dead code removed: SESSION_STORAGE_KEY, the unused isTerminal export, the unsent PROVIDER_PROBE type and handler; schema version has one owner; popup refresh interval cleared on pagehide.",
+      "Release gate repaired: separator-safe static check, cross-platform Python launcher, Chrome/Edge discovery, and one documented release-scope exclusion for three unreachable WIP modules. The three modules and their test were subsequently removed on user instruction, so the exclusion machinery was deleted and src/ now contains only reachable project code.",
+      "Recovered an unmerged fix: commit bb19450 (v0.5.14 enforce single Cast relay path) was never on the released line. Live v0.6.0 testing reproduced its forbidden sequence (CAST_RELAY_DELIVERED followed by TRUSTED_JW_CAST_CONTROL, a Cast picker opening, progression stopping). The port adds driveStickyCastContinuation as the single retained-Cast strategy selector and isRetainedCastRelayInFlight so a helper cannot become a second success producer while the D-028 relay transfers; the static gate now enforces both.",
+      "The manifest now carries a public key pinning the extension ID so a moved or re-extracted checkout keeps its host permissions. The private key is kept outside the repository."
+    ],
+    "local_evidence": [
+      "83/83 unit/orchestration tests pass, including the retained-relay single-success regression; each decisive test was A/B-run against the pre-fix commit and failed there.",
+      "npm run check completes end to end on Windows: DOM fixture PASS, provider fixture PASS (including CAST_LEGACY_MEDIA_PUSH, CAST_SENDER_OVERLAP, CAST_OPAQUE_JW_RELAY and the mutually-exclusive relay/Cast-control assertion), STATIC CHECK PASS, EXTENSION PACKAGE VALIDATION PASS against installed Chrome, PROJECT GATE PASS.",
+      "Independent verification over three rounds re-ran its own falsification harnesses: dead latch cleared and next attach local, successful promote retains identity, stale writes and Stop resurrection fixed, one auto-resume per block transition, concurrent GET_STATUS + grant collapses to one attach, lost grant vs new origin preserved, live Cast status survives an attach save, no deadlock and no lost Stop.",
+      "Release artifact contains 21 entries: manifest, README and 19 reachable src files; no tests, scripts or unreachable WIP module.",
+      "Listener/timer audit: the legacy Cast listener is bound once, rebound on media identity change, unbound on pagehide; no unbounded Map/storage growth was found in the repaired paths."
+    ],
+    "verification_verdict": "SHIP WITH RESIDUAL RISK — every confirmed code defect repaired, no new deadlock/lost Stop/double attach/erased status reproduced; residual risk is live-device evidence.",
+    "live_observation": {
+      "date": "2026-11-16",
+      "result": "PARTIAL — pause and Chromecast worked; episode-end advance did not",
+      "observed": "Popup stayed RUNNING with playbackAuthority NONE ('Wiedergabe: Übergang / noch nicht gestartet') while lastMedia was MEDIA_PLAYING player=GoogleCast and Cast stayed connected. A Google Cast picker popup opened in the browser during Cast. The trace contained CAST_RELAY_DELIVERED -> CAST_RELAY_REMOTE_PLAYING -> JW_CAST_ACTIVE -> TRUSTED_JW_CAST_CONTROL.",
+      "interpretation": "This is the forbidden competing-path sequence described by the unmerged bb19450 note. The port removes that sequence; whether the episode-end advance is fully restored after the port still requires a live retest, and a session dump from a recurrence would settle whether the end signal or the transition was the failing step."
+    },
+    "live_pending": [
+      "Retest episode-end advance after the single-relay-path port, including a minimized-window run.",
+      "Backgrounded Chromecast rollover on VOE: minimize the browser during an episode and confirm the receiver advances without the page being foreground.",
+      "Real permission revocation/restriction: confirm a lost grant is reported as PREVIOUSLY_GRANTED and auto-resumes once access returns.",
+      "Hidden-page deadline latency: the 30 s promotion and 60 s export bounds can stretch to roughly 60 s and 120 s under intensive throttling; they still terminate.",
+      "A slow but alive receiver can hit the 30 s promotion bound and lose the retained identity (bounded false negative).",
+      "Long-paused VOE/JW memory behaviour and multi-episode live soak remain unmeasured.",
+      "Doodstream/playmogo retained-Cast rollover remains deferred by user decision."
+    ],
+    "browser_attempt": {
+      "command": "npm run test:browser",
+      "result": "INCONCLUSIVE",
+      "notes": "Installed branded Chrome does not load the unpacked extension via --load-extension in this environment, and the Playwright Chromium run fails on a pre-existing harness serialization bug (CDP returnByValue on a DOM node). Not treated as a pass."
+    }
   }
 }

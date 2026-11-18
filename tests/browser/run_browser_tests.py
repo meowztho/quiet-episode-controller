@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -19,7 +20,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import websocket
 
 ROOT = Path(__file__).resolve().parents[2]
-CHROMIUM = os.environ.get("CHROMIUM", "/usr/bin/chromium")
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from browser_path import describe_failure, find_browser
+
+CHROMIUM = find_browser()
 
 
 def free_port() -> int:
@@ -174,6 +179,13 @@ def js(value):
 
 
 def main():
+    if not CHROMIUM:
+        print("BROWSER TESTS: INCONCLUSIVE - Chromium not found")
+        print(describe_failure())
+        return 2
+
+    print(f"BROWSER TESTS: browser {CHROMIUM}")
+
     provider_routes = {
         "/provider": (200, "text/html", """
 <!doctype html><html><body><video id="v"></video><script>

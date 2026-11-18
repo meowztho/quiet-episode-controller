@@ -86,7 +86,16 @@ function render(status) {
   } else if (status?.cast?.available) {
     lines.push("Cast: verfügbar · Gerät einmal im Player auswählen");
   }
-  if (status?.blockedReason) lines.push(`Status: ${status.blockedReason}`);
+  if (status?.blockedReason === "PROVIDER_PERMISSION_REQUIRED" && status?.pendingPermissionOrigin) {
+    const origin = status.pendingPermissionOrigin;
+    lines.push(status.permissionBlockKind === "PREVIOUSLY_GRANTED"
+      ? `Zugriff auf ${origin} ist verloren gegangen – bitte erneut erteilen`
+      : `Neuer Hoster-Host ${origin} – Zugriff erforderlich`);
+  } else if (status?.blockedReason === "PREPARE_STALLED") {
+    lines.push("Status: Vorbereitung hängt – bitte Stop und erneut Starten");
+  } else if (status?.blockedReason) {
+    lines.push(`Status: ${status.blockedReason}`);
+  }
   if (status?.lastMedia?.type) {
     const media = status.lastMedia.payload || {};
     const detail = [
@@ -100,7 +109,6 @@ function render(status) {
     ].filter(Boolean).join(" · ");
     lines.push(detail);
   }
-  if (status?.pendingPermissionOrigin) lines.push(`Benötigt Zugriff: ${status.pendingPermissionOrigin}`);
   els.details.textContent = lines.join("\n");
 
   const active = status?.lifecycle === SessionLifecycle.ACTIVE;
@@ -250,7 +258,8 @@ async function initialize() {
     els.error.textContent = `Vollbild-Einstellung nicht geladen: ${String(error?.message || error)}`;
   }
   await refresh();
-  setInterval(refresh, 1000);
+  const refreshTimer = setInterval(refresh, 1000);
+  window.addEventListener("pagehide", () => clearInterval(refreshTimer), { once: true });
 }
 
 void initialize();

@@ -6,19 +6,25 @@ import {
   block,
   clearCastRelay,
   clearPlaybackSurface,
+  clearRetainedCast,
   clearRetiringPlaybackSurface,
   createSession,
+  isPrepareStalled,
+  isRetainedCastRelayInFlight,
   isSessionActive,
   markPlaybackSurfaceLost,
   markProviderAttached,
+  PREPARE_STALL_RECOVERY_LIMIT,
   recordCastStatus,
   recordMedia,
   recordPlaybackActivationAttempt,
   recordProviderFailure,
+  recordStallRecoveryAttempt,
   requireProviderPermission,
   promoteRetiringPlaybackSurface,
   retirePlaybackSurface,
   selectProvider,
+  SESSION_SCHEMA_VERSION,
   setPlaybackDocument,
   setPlaybackTab,
   stop
@@ -50,7 +56,6 @@ const PROVIDER_ATTACH_INTERVAL_MS = 150;
 const PROVIDER_ORIGIN_HOP_LIMIT = 6;
 const PLAYBACK_NAVIGATION_TIMEOUT_MS = 10000;
 const PLAYBACK_NAVIGATION_INTERVAL_MS = 150;
-const SESSION_SCHEMA_VERSION = 8;
 const CAST_REMOTE_ACTIONS = new Set(Object.values(CastRemoteAction));
 
 function newSessionId() {
@@ -64,8 +69,49 @@ async function loadCurrentSession() {
   try {
     await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
   } catch {}
+  // This runs inside loadCurrentSession, which is itself called from inside the
+  // write queue. It discards an incompatible session before any valid queued
+  // read-modify-save can exist for it, so it must not acquire the queue again.
   await saveSession(null);
   return null;
+}
+
+function sessionIsCurrent(current, expected, { requireActive = true } = {}) {
+  return Boolean(
+    current &&
+    expected &&
+    (!requireActive || isSessionActive(current)) &&
+    current.sessionId === expected.sessionId &&
+    current.epoch === expected.epoch
+  );
+}
+
+// Stop and the short guarded writes below share this mutex. Holding it only for
+// the load/modify/save keeps the long provider navigation and attach waits out of
+// the critical section while preventing a Stop that lands during the save from
+// being overwritten by an older snapshot.
+let sessionWriteTail = Promise.resolve();
+function withSessionWrite(operation) {
+  const result = sessionWriteTail.then(operation);
+  sessionWriteTail = result.catch(() => {});
+  return result;
+}
+
+// Long-running attach/permission work must not write a snapshot captured before
+// its awaits. Re-load first, then apply the intended patch to the live session so
+// a concurrent Stop, Cast status or tab transition is never overwritten.
+// Cleanup writes that may legitimately run after COMPLETE (surface/tab removal)
+// pass requireActive:false; the session id and epoch still fence a restarted
+// episode, so an old cleanup can never touch the new session.
+async function updateCurrentSession(expected, update, options = {}) {
+  return await withSessionWrite(async () => {
+    const current = await loadCurrentSession();
+    if (!sessionIsCurrent(current, expected, options)) return { session: current, stale: true };
+    const next = update(current);
+    if (!next) return { session: current, stale: true };
+    await saveSession(next);
+    return { session: next, stale: false };
+  });
 }
 
 function publicStatus(session) {
@@ -83,6 +129,8 @@ function publicStatus(session) {
       retiringPlaybackProvider: null,
       playbackDocument: null,
       pendingPermissionOrigin: null,
+      permissionBlockKind: null,
+      lastGrantedPermissionOrigin: null,
       blockedReason: null,
       providerFailoverEnabled: false,
       attemptedProviders: [],
@@ -112,6 +160,8 @@ function publicStatus(session) {
     playbackDocument: session.playbackDocument,
     playbackActivationAttempts: session.playbackActivationAttempts ?? 0,
     pendingPermissionOrigin: session.pendingPermissionOrigin,
+    permissionBlockKind: session.permissionBlockKind ?? null,
+    lastGrantedPermissionOrigin: session.lastGrantedPermissionOrigin ?? null,
     blockedReason: session.blockedReason,
     lastMedia: session.lastMedia,
     diagnostics: session.diagnostics ?? []
@@ -140,6 +190,19 @@ function isTransientProviderAttachError(error) {
     message.includes("no frame with id") ||
     message.includes("frame was removed") ||
     message.includes("playback_document_not_ready")
+  );
+}
+
+// Chrome reports a missing/revoked host permission as a scripting failure, not as
+// a provider defect. Treat it as a new exact-origin permission boundary so Auto
+// does not fail over to a different provider.
+function isAccessDeniedError(error) {
+  const message = String(error?.message || error).toLowerCase();
+  return (
+    message.includes("cannot access contents of the page") ||
+    message.includes("extension manifest must request permission") ||
+    message.includes("missing host permission") ||
+    message.includes("cannot be scripted")
   );
 }
 
@@ -197,6 +260,9 @@ async function injectAndHandshakeProvider(session, initialDocument) {
         document = current;
       } catch {}
 
+      if (isAccessDeniedError(error)) {
+        return { attached: false, document, reason: "PROVIDER_PERMISSION_REQUIRED" };
+      }
       if (!isTransientProviderAttachError(error) || attempt === PROVIDER_ATTACH_ATTEMPTS) break;
       await new Promise((resolve) => setTimeout(resolve, PROVIDER_ATTACH_INTERVAL_MS));
     }
@@ -211,14 +277,16 @@ async function attachPlaybackSurface(session) {
   let document = await currentPlaybackDocument(session.playbackTabId);
 
   for (let hop = 0; hop < PROVIDER_ORIGIN_HOP_LIMIT; hop += 1) {
-    session = setPlaybackDocument(session, document);
-    await saveSession(session);
+    const documentUpdate = await updateCurrentSession(session, (current) =>
+      setPlaybackDocument(current, document));
+    if (documentUpdate.stale) return documentUpdate.session;
+    session = documentUpdate.session;
 
     const permission = await getPermissionState(document.origin);
     if (permission.state !== "GRANTED") {
-      const blocked = requireProviderPermission(session, document.origin, document);
-      await saveSession(blocked);
-      return blocked;
+      const blockedUpdate = await updateCurrentSession(session, (current) =>
+        requireProviderPermission(current, document.origin, document));
+      return blockedUpdate.session;
     }
 
     // The retiring Cast sender remains visible while a temporary helper
@@ -233,10 +301,16 @@ async function attachPlaybackSurface(session) {
 
     const result = await injectAndHandshakeProvider(session, document);
     if (result.attached) {
-      const attachedSession = setPlaybackDocument(session, result.document);
-      const running = markProviderAttached(attachedSession);
-      await saveSession(running);
-      return running;
+      const attachedOrigin = result.document?.origin ?? document.origin;
+      const attachedUpdate = await updateCurrentSession(session, (current) =>
+        markProviderAttached(setPlaybackDocument(current, result.document), attachedOrigin));
+      return attachedUpdate.session;
+    }
+
+    if (result.reason === "PROVIDER_PERMISSION_REQUIRED") {
+      const permissionUpdate = await updateCurrentSession(session, (current) =>
+        requireProviderPermission(current, result.document.origin, result.document));
+      return permissionUpdate.session;
     }
 
     if (result.reason !== "PROVIDER_ORIGIN_CHANGED" || !result.document?.origin) {
@@ -258,23 +332,19 @@ async function openSelectedPlayback(session) {
     // Register the tab as soon as it exists, not after redirect settlement:
     // Stop/controller-close must be able to find and close an in-flight tab.
     onCreated: async (tabId) => {
-      const current = await loadCurrentSession();
-      if (!isSessionActive(current) || current.sessionId !== session.sessionId || current.epoch !== session.epoch) {
-        throw new Error("PLAYBACK_OPEN_CANCELLED");
-      }
-      session = setPlaybackTab(session, tabId);
-      await saveSession(session);
+      const update = await updateCurrentSession(session, (current) => setPlaybackTab(current, tabId));
+      if (update.stale) throw new Error("PLAYBACK_OPEN_CANCELLED");
+      session = update.session;
     }
   });
 
-  const current = await loadCurrentSession();
-  if (!isSessionActive(current) || current.sessionId !== session.sessionId ||
-      current.epoch !== session.epoch || current.playbackTabId !== opened.tabId) {
+  const update = await updateCurrentSession(session, (current) =>
+    current.playbackTabId === opened.tabId ? setPlaybackDocument(current, opened.document) : null);
+  if (update.stale) {
     await closePlaybackSurface(opened.tabId);
     throw new Error("PLAYBACK_OPEN_CANCELLED");
   }
-  session = setPlaybackDocument(session, opened.document);
-  await saveSession(session);
+  session = update.session;
   return await attachPlaybackSurface(session);
 }
 
@@ -283,18 +353,17 @@ async function enterInitialWindowMode(session) {
 
   try {
     const windowResult = await enterPlaybackMode(session.windowId);
-    const updated = {
-      ...session,
+    const update = await updateCurrentSession(session, (current) => ({
+      ...current,
       originalWindowState: windowResult.originalState,
       changedWindowMode: windowResult.changed,
       updatedAt: Date.now()
-    };
-    await saveSession(updated);
-    return updated;
+    }));
+    return update.session;
   } catch (error) {
-    const blocked = block(session, "WINDOW_FULLSCREEN_FAILED", [String(error?.message || error)]);
-    await saveSession(blocked);
-    return blocked;
+    const update = await updateCurrentSession(session, (current) =>
+      block(current, "WINDOW_FULLSCREEN_FAILED", [String(error?.message || error)]));
+    return update.session;
   }
 }
 
@@ -314,10 +383,11 @@ function providerFailureDiagnostics(session) {
 
 async function blockNoWorkingProvider(session) {
   session = await finishRetiringPlaybackTab(session);
-  const reason = (session.attemptedProviders ?? []).length ? "NO_WORKING_PROVIDER" : "NO_PROVIDER_AVAILABLE";
-  const blocked = block(session, reason, providerFailureDiagnostics(session));
-  await saveSession(blocked);
-  return blocked;
+  const update = await updateCurrentSession(session, (current) => {
+    const reason = (current.attemptedProviders ?? []).length ? "NO_WORKING_PROVIDER" : "NO_PROVIDER_AVAILABLE";
+    return block(current, reason, providerFailureDiagnostics(current));
+  });
+  return update.session;
 }
 
 async function openProviderCandidateLoop(session, probe) {
@@ -329,8 +399,9 @@ async function openProviderCandidateLoop(session, probe) {
     );
     if (!candidate) return await blockNoWorkingProvider(session);
 
-    session = selectProvider(session, candidate);
-    await saveSession(session);
+    const selected = await updateCurrentSession(session, (current) => selectProvider(current, candidate));
+    if (selected.stale) return selected.session;
+    session = selected.session;
 
     try {
       const opened = await openSelectedPlayback(session);
@@ -343,13 +414,14 @@ async function openProviderCandidateLoop(session, probe) {
 
       if (!session.providerFailoverEnabled) {
         if (Number.isInteger(session.playbackTabId)) session = await finishPlaybackTab(session);
-        session = block(session, reason, [reason]);
-        await saveSession(session);
-        return session;
+        const blocked = await updateCurrentSession(session, (current) => block(current, reason, [reason]));
+        return blocked.session;
       }
 
-      session = recordProviderFailure(session, reason, { phase: "provider-setup" });
-      await saveSession(session);
+      const failed = await updateCurrentSession(session, (current) =>
+        recordProviderFailure(current, reason, { phase: "provider-setup" }));
+      if (failed.stale) return failed.session;
+      session = failed.session;
       if (Number.isInteger(session.playbackTabId)) session = await finishPlaybackTab(session);
     }
   }
@@ -359,24 +431,24 @@ async function probeCurrentEpisodeForFailover(session) {
   try {
     const probe = await probeEpisode(session.tabId);
     if (!probe?.supported || !sameEpisodeIdentity(probe.episodeIdentity, session.currentEpisode)) {
-      const blocked = block(session, "CONTROLLER_EPISODE_CHANGED_DURING_FAILOVER", probe?.diagnostics ?? []);
-      await saveSession(blocked);
-      return { session: blocked, probe: null };
+      const update = await updateCurrentSession(session, (current) =>
+        block(current, "CONTROLLER_EPISODE_CHANGED_DURING_FAILOVER", probe?.diagnostics ?? []));
+      return { session: update.session, probe: null };
     }
     return { session, probe };
   } catch (error) {
     const reason = String(error?.message || error);
-    const blocked = block(session, reason, [reason]);
-    await saveSession(blocked);
-    return { session: blocked, probe: null };
+    const update = await updateCurrentSession(session, (current) => block(current, reason, [reason]));
+    return { session: update.session, probe: null };
   }
 }
 
 async function failoverToNextProvider(session, reason, payload = null) {
-  if (!session?.providerFailoverEnabled) return session;
+  if (!session?.providerFailoverEnabled || !isSessionActive(session)) return session;
 
-  session = recordProviderFailure(session, reason, payload);
-  await saveSession(session);
+  const failed = await updateCurrentSession(session, (current) => recordProviderFailure(current, reason, payload));
+  if (failed.stale) return failed.session;
+  session = failed.session;
   if (Number.isInteger(session.playbackTabId)) session = await finishPlaybackTab(session);
 
   const reprobe = await probeCurrentEpisodeForFailover(session);
@@ -389,30 +461,28 @@ async function prepareEpisode(session, { enterWindow = false } = {}) {
   try {
     if (Number.isInteger(session.playbackTabId)) {
       const staleTabId = session.playbackTabId;
-      session = clearPlaybackSurface(session);
-      await saveSession(session);
+      const cleared = await updateCurrentSession(session, clearPlaybackSurface);
+      if (cleared.stale) return cleared.session;
+      session = cleared.session;
       await closePlaybackSurface(staleTabId);
     }
 
     const probe = await probeEpisode(session.tabId);
-    const current = await loadCurrentSession();
-    if (!isSessionActive(current) || current.sessionId !== session.sessionId) return current;
-    session = beginEpisode(current, probe);
-    await saveSession(session);
+    const begun = await updateCurrentSession(session, (current) => beginEpisode(current, probe));
+    if (begun.stale) return begun.session;
+    session = begun.session;
     if (session.state === SessionState.BLOCKED) return session;
 
     session = await openProviderCandidateLoop(session, probe);
+    if (!session) return await loadCurrentSession();
     if (enterWindow && ![SessionState.BLOCKED, SessionState.STOPPED, SessionState.COMPLETED].includes(session.state)) {
       session = await enterInitialWindowMode(session);
     }
     return session;
   } catch (error) {
-    const current = await loadCurrentSession();
-    if (!isSessionActive(current) || current.sessionId !== session.sessionId) return current;
     const reason = String(error?.message || error);
-    session = block(current, reason, [reason]);
-    await saveSession(session);
-    return session;
+    const update = await updateCurrentSession(session, (current) => block(current, reason, [reason]));
+    return update.session;
   }
 }
 
@@ -446,7 +516,10 @@ async function startSession(payload) {
     providerPriority,
     providerFailoverEnabled
   });
-  await saveSession(session);
+  // A brand-new session has no prior snapshot to re-load. Route the write
+  // through the same queue anyway so it cannot interleave with an in-flight
+  // read-modify-save on the previous session.
+  await withSessionWrite(() => saveSession(session));
   session = await prepareEpisode(session, { enterWindow: true });
   return publicStatus(session);
 }
@@ -523,31 +596,44 @@ async function handleCastRemoteControl(payload) {
   let session = await loadCurrentSession();
   const response = await sendCastRemoteControl(session, payload);
   if (response?.status) {
-    session = recordCastStatus(session, response.status);
-    await saveSession(session);
+    const update = await updateCurrentSession(session, (current) =>
+      recordCastStatus(current, response.status));
+    session = update.session;
   }
   return publicStatus(session);
 }
 
 async function handleStop() {
-  let session = await loadCurrentSession();
-  if (!session) return publicStatus(null);
+  const observed = await loadCurrentSession();
+  if (!observed) return publicStatus(null);
 
-  const playbackTabId = session.playbackTabId;
-  const retiringPlaybackTabId = session.retiringPlaybackTabId;
   if (
-    isSessionActive(session) &&
-    session.playbackAuthority === PlaybackAuthority.CAST &&
-    session.cast?.connected &&
-    session.cast?.remoteControlAvailable &&
-    Number.isInteger(playbackTabId)
+    isSessionActive(observed) &&
+    observed.playbackAuthority === PlaybackAuthority.CAST &&
+    observed.cast?.connected &&
+    observed.cast?.remoteControlAvailable &&
+    Number.isInteger(observed.playbackTabId)
   ) {
     try {
-      await sendCastRemoteControl(session, { action: CastRemoteAction.STOP });
+      await sendCastRemoteControl(observed, { action: CastRemoteAction.STOP });
     } catch {}
   }
-  session = stop(session);
-  await saveSession(session);
+
+  // Re-load inside the shared short-write mutex: an attach save that started
+  // before Stop must not land after the ENDED write and resurrect the session.
+  let playbackTabId = null;
+  let retiringPlaybackTabId = null;
+  const stopped = await withSessionWrite(async () => {
+    const current = await loadCurrentSession();
+    if (!current) return null;
+    playbackTabId = current.playbackTabId;
+    retiringPlaybackTabId = current.retiringPlaybackTabId;
+    if (!isSessionActive(current)) return current;
+    const next = stop(current);
+    await saveSession(next);
+    return next;
+  });
+  const session = stopped ?? observed;
 
   if (Number.isInteger(playbackTabId)) {
     try {
@@ -564,50 +650,83 @@ async function handleStop() {
   return publicStatus(session);
 }
 
-async function handlePermissionGranted() {
+let permissionGrantOperation = null;
+
+async function handlePermissionGranted(payload = {}) {
   let session = await loadCurrentSession();
   if (!session || session.blockedReason !== "PROVIDER_PERMISSION_REQUIRED") return publicStatus(session);
 
+  const origin = String(session.pendingPermissionOrigin || payload?.origin || "");
+  if (origin) {
+    const update = await updateCurrentSession(session, (current) => ({
+      ...current,
+      lastGrantedPermissionOrigin: origin,
+      permissionBlockKind: null,
+      updatedAt: Date.now()
+    }));
+    if (update.stale) return publicStatus(update.session);
+    session = update.session;
+  }
+
   try {
     session = await attachPlaybackSurface(session);
+    if (!session) return publicStatus(await loadCurrentSession());
     if (![SessionState.BLOCKED, SessionState.STOPPED, SessionState.COMPLETED].includes(session.state)) {
       session = await enterInitialWindowMode(session);
     }
   } catch (error) {
+    const current = await loadCurrentSession();
+    if (!sessionIsCurrent(current, session)) return publicStatus(current);
+    session = current;
     const reason = String(error?.message || error);
     if (session.providerFailoverEnabled) {
       session = await failoverToNextProvider(session, reason, { phase: "post-permission-attach" });
     } else {
       if (Number.isInteger(session.playbackTabId)) session = await finishPlaybackTab(session);
-      session = block(session, reason, [reason]);
-      await saveSession(session);
+      const update = await updateCurrentSession(session, (latest) => block(latest, reason, [reason]));
+      session = update.session;
     }
   }
   return publicStatus(session);
 }
 
+// The popup button and the GET_STATUS auto-resume share one resume operation so
+// a granted permission can never attach twice.
+function runPermissionGranted(payload = {}) {
+  if (permissionGrantOperation) return permissionGrantOperation;
+  const operation = handlePermissionGranted(payload).finally(() => {
+    if (permissionGrantOperation === operation) permissionGrantOperation = null;
+  });
+  permissionGrantOperation = operation;
+  return operation;
+}
+
 async function finishPlaybackTab(session) {
-  const playbackTabId = session.playbackTabId;
-  session = clearPlaybackSurface(session);
-  await saveSession(session);
-  if (Number.isInteger(playbackTabId)) await closePlaybackSurface(playbackTabId);
-  return session;
+  let playbackTabId = null;
+  const update = await updateCurrentSession(session, (current) => {
+    playbackTabId = current.playbackTabId;
+    return clearPlaybackSurface(current);
+  }, { requireActive: false });
+  if (!update.stale && Number.isInteger(playbackTabId)) await closePlaybackSurface(playbackTabId);
+  return update.session;
 }
 
 async function retireCurrentPlaybackTab(session) {
-  session = retirePlaybackSurface(session);
-  await saveSession(session);
-  return session;
+  const update = await updateCurrentSession(session, retirePlaybackSurface);
+  return update.session;
 }
 
 async function finishRetiringPlaybackTab(session) {
-  const retiringPlaybackTabId = session?.retiringPlaybackTabId;
-  if (!Number.isInteger(retiringPlaybackTabId)) return clearCastRelay(session);
-  session = clearCastRelay(session);
-  session = clearRetiringPlaybackSurface(session);
-  await saveSession(session);
-  await closePlaybackSurface(retiringPlaybackTabId);
-  return session;
+  if (!Number.isInteger(session?.retiringPlaybackTabId)) return clearCastRelay(session);
+  let retiringPlaybackTabId = null;
+  const update = await updateCurrentSession(session, (current) => {
+    retiringPlaybackTabId = current.retiringPlaybackTabId;
+    return clearRetiringPlaybackSurface(clearCastRelay(current));
+  }, { requireActive: false });
+  if (!update.stale && Number.isInteger(retiringPlaybackTabId)) {
+    await closePlaybackSurface(retiringPlaybackTabId);
+  }
+  return update.session;
 }
 
 async function notifyCastRelayFailure(session, reason) {
@@ -639,9 +758,13 @@ async function handleCastRelayItem(message, sender) {
   }
 
   const relayToken = `${session.sessionId}:${session.epoch}:cast-relay`;
-  session = beginCastRelay(session, relayToken);
-  session = recordCastStatus(session, { traceEvent: "CAST_RELAY_ITEM_READY" });
-  await saveSession(session);
+  const started = await updateCurrentSession(session, (current) => {
+    if (current.retiringPlaybackTabId !== retiringTabId || !current.cast?.sticky) return null;
+    if (current.retiringPlaybackProvider !== current.selectedProvider?.provider) return null;
+    return recordCastStatus(beginCastRelay(current, relayToken), { traceEvent: "CAST_RELAY_ITEM_READY" });
+  });
+  if (started.stale) return;
+  session = started.session;
 
   try {
     const response = await chrome.tabs.sendMessage(
@@ -650,17 +773,22 @@ async function handleCastRelayItem(message, sender) {
       { frameId: 0 }
     );
     if (!response?.ok) throw new Error(response?.reason || "CAST_RELAY_APPLY_FAILED");
-    session = await loadCurrentSession();
-    if (session?.cast?.relayToken === relayToken) {
-      session = recordCastStatus(session, { traceEvent: "CAST_RELAY_DELIVERED" });
-      await saveSession(session);
-    }
+    const delivered = await updateCurrentSession(session, (current) =>
+      current.cast?.relayToken === relayToken
+        ? recordCastStatus(current, { traceEvent: "CAST_RELAY_DELIVERED" })
+        : null);
+    session = delivered.session;
   } catch (error) {
-    session = await loadCurrentSession();
-    if (session?.cast?.relayToken === relayToken) {
-      session = clearCastRelay(session, "FAILED");
-      session = recordCastStatus(session, { traceEvent: "CAST_RELAY_DELIVERY_FAILED" });
-      await saveSession(session);
+    let relayFailed = false;
+    const failed = await updateCurrentSession(session, (current) => {
+      if (current.cast?.relayToken !== relayToken) return null;
+      relayFailed = true;
+      return recordCastStatus(clearRetainedCast(clearCastRelay(current, "FAILED")), {
+        traceEvent: "CAST_RELAY_DELIVERY_FAILED"
+      });
+    });
+    session = failed.session;
+    if (relayFailed) {
       await notifyCastRelayFailure(session, String(error?.message || error || "CAST_RELAY_DELIVERY_FAILED"));
     }
   }
@@ -673,23 +801,28 @@ async function handleCastRelayPlaying(message, sender) {
   if (!session || sender.frameId !== 0 || tabId !== session.retiringPlaybackTabId) return;
   if (!transferId || transferId !== session.cast?.relayToken) return;
 
-  const sourceTabId = session.playbackTabId;
   const senderDocument = await currentPlaybackDocument(tabId).catch(() => null);
-  session = recordCastStatus(session, {
-    ...message.payload,
-    connected: true,
-    sessionId: message.payload?.sessionId || session.cast?.sessionId,
-    deviceName: message.payload?.deviceName || session.cast?.deviceName,
-    receiverApplicationId: message.payload?.receiverApplicationId || session.cast?.receiverApplicationId,
-    traceEvent: "CAST_RELAY_REMOTE_PLAYING"
+  let sourceTabId = null;
+  const update = await updateCurrentSession(session, (current) => {
+    if (current.retiringPlaybackTabId !== tabId || current.cast?.relayToken !== transferId) return null;
+    sourceTabId = current.playbackTabId;
+    const status = recordCastStatus(current, {
+      ...message.payload,
+      connected: true,
+      sessionId: message.payload?.sessionId || current.cast?.sessionId,
+      deviceName: message.payload?.deviceName || current.cast?.deviceName,
+      receiverApplicationId: message.payload?.receiverApplicationId || current.cast?.receiverApplicationId,
+      traceEvent: "CAST_RELAY_REMOTE_PLAYING"
+    });
+    const media = recordMedia(status, MessageType.MEDIA_PLAYING, {
+      ...message.payload,
+      playerKind: "GoogleCast",
+      relayTransfer: true
+    }).session;
+    return promoteRetiringPlaybackSurface(media, senderDocument);
   });
-  session = recordMedia(session, MessageType.MEDIA_PLAYING, {
-    ...message.payload,
-    playerKind: "GoogleCast",
-    relayTransfer: true
-  }).session;
-  session = promoteRetiringPlaybackSurface(session, senderDocument);
-  await saveSession(session);
+  if (update.stale) return;
+  session = update.session;
 
   try {
     await chrome.tabs.sendMessage(
@@ -714,9 +847,14 @@ async function handleCastRelayFailed(message, sender) {
   const transferId = String(message.payload?.transferId || "");
   if (!session || sender.frameId !== 0 || tabId !== session.retiringPlaybackTabId) return;
   if (!transferId || transferId !== session.cast?.relayToken) return;
-  session = clearCastRelay(session, "FAILED");
-  session = recordCastStatus(session, { traceEvent: "CAST_RELAY_FAILED" });
-  await saveSession(session);
+  const update = await updateCurrentSession(session, (current) => {
+    if (current.retiringPlaybackTabId !== tabId || current.cast?.relayToken !== transferId) return null;
+    return recordCastStatus(clearRetainedCast(clearCastRelay(current, "FAILED")), {
+      traceEvent: "CAST_RELAY_FAILED"
+    });
+  });
+  if (update.stale) return;
+  session = update.session;
   await notifyCastRelayFailure(session, message.payload?.reason || "CAST_RELAY_FAILED");
 }
 
@@ -727,9 +865,18 @@ async function handleMediaMessage(message, sender) {
   if (sender.frameId !== 0) return;
 
   if (message.type === MessageType.CAST_STATUS) {
-    session = recordCastStatus(session, message.payload);
-    await saveSession(session);
+    // Load, patch and save in one queue turn. An attach save that loaded just
+    // before this status must not be able to overwrite it with a stale snapshot.
+    const update = await updateCurrentSession(session, (current) => {
+      const status = recordCastStatus(current, message.payload);
+      return message.payload?.stickyResumeFailed ? clearRetainedCast(status) : status;
+    });
+    if (update.stale) return;
+    session = update.session;
     if (message.payload?.stickyResumeFailed && Number.isInteger(session.retiringPlaybackTabId)) {
+      // The retained receiver identity is dead regardless of whether a
+      // retiring sender is still registered. The sender-close path may already
+      // have cleared that tab before this status arrives.
       session = await finishRetiringPlaybackTab(session);
       if (Number.isInteger(session.playbackTabId)) {
         await activatePlaybackSurface(session.playbackTabId);
@@ -760,17 +907,18 @@ async function handleMediaMessage(message, sender) {
       return;
     }
 
-    session = {
-      ...session,
+    const update = await updateCurrentSession(session, (current) => ({
+      ...current,
       diagnostics: [
-        ...(session.diagnostics || []),
+        ...(current.diagnostics || []),
         activation.ok
           ? successDiagnostic
           : `cast-handoff: ${activation.reason || failureReason}`
       ],
       updatedAt: Date.now()
-    };
-    await saveSession(session);
+    }));
+    if (update.stale) return;
+    session = update.session;
     try {
       await chrome.tabs.sendMessage(
         tabId,
@@ -781,18 +929,20 @@ async function handleMediaMessage(message, sender) {
     return;
   }
 
-  const result = recordMedia(session, message.type, message.payload);
-  session = result.session;
-  await saveSession(session);
+  let action = null;
+  const mediaUpdate = await updateCurrentSession(session, (current) => {
+    const recorded = recordMedia(current, message.type, message.payload);
+    action = recorded.action;
+    return recorded.session;
+  });
+  if (mediaUpdate.stale) return;
+  session = mediaUpdate.session;
 
   if (message.type === MessageType.MEDIA_PLAYING && Number.isInteger(session.retiringPlaybackTabId)) {
-    if (message.payload?.playerKind === "GoogleCast") {
-      session = clearCastRelay(session, "REMOTE");
-      await saveSession(session);
-      session = await finishRetiringPlaybackTab(session);
-    } else if (!session.cast?.sticky) {
-      session = clearCastRelay(session, "LOCAL_FALLBACK");
-      await saveSession(session);
+    // D-028 relay mode has exactly one remote-success producer: CAST_RELAY_PLAYING
+    // from the retiring sender. A helper observing the same receiver must not
+    // close that sender or promote itself in parallel.
+    if ((message.payload?.playerKind === "GoogleCast" || !session.cast?.sticky) && !isRetainedCastRelayInFlight(session)) {
       session = await finishRetiringPlaybackTab(session);
     }
   }
@@ -803,20 +953,22 @@ async function handleMediaMessage(message, sender) {
     ["AUTOPLAY_BLOCKED", "PLAY_START_TIMEOUT"].includes(blockedReason);
 
   if (activationEligible && Number(session.playbackActivationAttempts || 0) < 1) {
-    session = recordPlaybackActivationAttempt(session);
-    await saveSession(session);
+    const attempt = await updateCurrentSession(session, recordPlaybackActivationAttempt);
+    if (attempt.stale) return;
+    session = attempt.session;
     const activation = message.payload?.playerKind === "JWPlayer"
       ? await invokeTrustedJwPlayback(tabId)
       : await invokeTrustedHtml5Playback(tabId);
 
     if (activation.ok) return;
 
-    session = {
-      ...session,
-      diagnostics: [...(session.diagnostics || []), `trusted-playback: ${activation.reason}`],
+    const failed = await updateCurrentSession(session, (current) => ({
+      ...current,
+      diagnostics: [...(current.diagnostics || []), `trusted-playback: ${activation.reason}`],
       updatedAt: Date.now()
-    };
-    await saveSession(session);
+    }));
+    if (failed.stale) return;
+    session = failed.session;
 
     if (session.providerFailoverEnabled) {
       await failoverToNextProvider(
@@ -844,7 +996,7 @@ async function handleMediaMessage(message, sender) {
     return;
   }
 
-  if (result.action?.type === "NAVIGATE_NEXT") {
+  if (action?.type === "NAVIGATE_NEXT") {
     const isStickyCastEnd = Boolean(
       message.payload?.playerKind === "GoogleCast" &&
       session.cast?.sticky &&
@@ -853,11 +1005,11 @@ async function handleMediaMessage(message, sender) {
     session = isStickyCastEnd
       ? await retireCurrentPlaybackTab(session)
       : await finishPlaybackTab(session);
-    await chrome.tabs.update(session.tabId, { url: result.action.target.url });
+    await chrome.tabs.update(session.tabId, { url: action.target.url });
     return;
   }
 
-  if (result.action?.type === "COMPLETE") {
+  if (action?.type === "COMPLETE") {
     session = await finishPlaybackTab(session);
     session = await finishRetiringPlaybackTab(session);
     await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
@@ -874,13 +1026,177 @@ function serializeSessionTransition(operation) {
   return result;
 }
 
+// One episode preparation at a time. A controller navigation can emit multiple
+// completion events before the first asynchronous provider tab is registered.
+let navigationOperation = null;
+
+function prepareInFlight() {
+  return Boolean(startOperation || navigationOperation || permissionGrantOperation);
+}
+
+async function reissueControllerNavigation(session) {
+  try {
+    const current = await loadCurrentSession();
+    if (!sessionIsCurrent(current, session)) return;
+    await chrome.tabs.update(session.tabId, { url: session.nextEpisode.url });
+  } catch (error) {
+    await updateCurrentSession(session, (current) =>
+      block(current, "PREPARE_STALLED", [
+        `navigation recovery failed: ${String(error?.message || error)}`
+      ]));
+  }
+}
+
+// Popup polling is the only trigger. A stalled prepare gets one bounded retry;
+// the second stall becomes an explicit BLOCKED state instead of a retry loop.
+// The retry itself runs outside the transition serializer so media/Cast
+// messages are not blocked by its navigation wait.
+async function recoverStalledPrepare(session) {
+  if (!isPrepareStalled(session) || prepareInFlight()) return session;
+
+  return await serializeSessionTransition(async () => {
+    const current = await loadCurrentSession();
+    if (!isPrepareStalled(current) || prepareInFlight()) return current;
+
+    if (Number(current.stallRecoveryAttempts || 0) >= PREPARE_STALL_RECOVERY_LIMIT) {
+      const update = await updateCurrentSession(current, (latest) =>
+        block(latest, "PREPARE_STALLED", [
+          "automatic preparation recovery also stalled"
+        ]));
+      return update.session;
+    }
+
+    const retry = await updateCurrentSession(current, recordStallRecoveryAttempt);
+    if (retry.stale) return retry.session;
+    const retrySession = retry.session;
+
+    if (retrySession.state === SessionState.NAVIGATING && retrySession.nextEpisode) {
+      // The controller navigation is the missing step. onUpdated owns the
+      // actual prepare; the fresh phaseStartedAt bounds the next check.
+      void reissueControllerNavigation(retrySession).catch(() => {});
+      return retrySession;
+    }
+
+    const operation = prepareEpisode(retrySession, { enterWindow: true });
+    navigationOperation = operation;
+    void operation.catch(() => {}).finally(() => {
+      if (navigationOperation === operation) navigationOperation = null;
+    });
+    return retrySession;
+  });
+}
+
+function permissionResumeKeyFor(session) {
+  if (session?.blockedReason !== "PROVIDER_PERMISSION_REQUIRED" || !session.pendingPermissionOrigin) return null;
+  return `${session.pendingPermissionOrigin}|${session.permissionBlockKind ?? ""}`;
+}
+
+async function markPermissionResume(session, resumeKey) {
+  return await updateCurrentSession(session, (current) => {
+    if (permissionResumeKeyFor(current) !== resumeKey || current.permissionResumeKey === resumeKey) return null;
+    return { ...current, permissionResumeKey: resumeKey };
+  });
+}
+
+async function markPermissionResumeResult(resumeKey) {
+  const current = await loadCurrentSession();
+  if (!current) return null;
+  // A failed attempt can reclassify the same block (NEW_ORIGIN ->
+  // PREVIOUSLY_GRANTED). Mark the resulting key too, otherwise the next poll
+  // would start another full attach against a persistent denial.
+  const afterKey = permissionResumeKeyFor(current);
+  if (!afterKey || afterKey === resumeKey) return current;
+  const update = await updateCurrentSession(current, (latest) =>
+    permissionResumeKeyFor(latest) === afterKey && latest.permissionResumeKey !== afterKey
+      ? { ...latest, permissionResumeKey: afterKey }
+      : null);
+  return update.session;
+}
+
+// One auto-resume at a time. The persisted marker bounds settled failures;
+// this promise only collapses concurrent popup polls onto the same attempt.
+let permissionAutoResumeOperation = null;
+
+function autoResumePermission() {
+  if (permissionAutoResumeOperation) return permissionAutoResumeOperation;
+  const operation = (async () => {
+    // Claim the block inside the shared transition queue: re-load after any
+    // popup grant that was already running, then skip a consumed key or an
+    // attach that is already in flight. The claim is a short write; the long
+    // attach runs after the queue is released so media/Cast transitions are not
+    // blocked by provider injection.
+    const claim = await serializeSessionTransition(async () => {
+      const current = await loadCurrentSession();
+      if (!current) return { session: null, claimed: false };
+      const resumeKey = permissionResumeKeyFor(current);
+      if (!resumeKey || current.permissionResumeKey === resumeKey) {
+        return { session: current, claimed: false };
+      }
+      if (permissionGrantOperation) return { session: current, claimed: false };
+
+      // Mark before the attempt so a worker suspension cannot repeat it and a
+      // concurrent popup grant sees the key as consumed.
+      const marked = await markPermissionResume(current, resumeKey);
+      if (marked.stale) return { session: marked.session, claimed: false };
+      return { session: marked.session, claimed: true, resumeKey };
+    });
+
+    if (!claim.claimed) return claim.session;
+    await runPermissionGranted();
+    return await markPermissionResumeResult(claim.resumeKey);
+  })();
+  const tracked = operation.finally(() => {
+    if (permissionAutoResumeOperation === tracked) permissionAutoResumeOperation = null;
+  });
+  permissionAutoResumeOperation = tracked;
+  return tracked;
+}
+
+async function handlePermissionGrantedRequest(payload = {}) {
+  const session = await loadCurrentSession();
+  if (!session || session.blockedReason !== "PROVIDER_PERMISSION_REQUIRED") return publicStatus(session);
+
+  // The explicit popup grant consumes the same persisted key before attaching.
+  // A concurrent GET_STATUS auto-resume therefore either sees the key already
+  // consumed or joins the same single-flight attach operation.
+  const resumeKey = permissionResumeKeyFor(session);
+  if (resumeKey) await markPermissionResume(session, resumeKey);
+  await runPermissionGranted(payload);
+  const result = resumeKey ? await markPermissionResumeResult(resumeKey) : await loadCurrentSession();
+  return publicStatus(result);
+}
+
+async function handleGetStatus() {
+  let session = await loadCurrentSession();
+  if (!session) return publicStatus(null);
+
+  if (
+    session.blockedReason === "PROVIDER_PERMISSION_REQUIRED" &&
+    session.pendingPermissionOrigin &&
+    !startOperation &&
+    !navigationOperation
+  ) {
+    let permission = null;
+    try {
+      permission = await getPermissionState(session.pendingPermissionOrigin);
+    } catch {}
+    if (permission?.state === "GRANTED") {
+      session = await autoResumePermission();
+      if (!session) return publicStatus(null);
+    }
+  }
+
+  session = await recoverStalledPrepare(session);
+  return publicStatus(session);
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!isEnvelope(message)) return;
 
   (async () => {
     switch (message.type) {
       case MessageType.GET_STATUS:
-        return { ok: true, version: PROTOCOL_VERSION, status: publicStatus(await loadCurrentSession()) };
+        return { ok: true, version: PROTOCOL_VERSION, status: await handleGetStatus() };
       case MessageType.START:
         return { ok: true, version: PROTOCOL_VERSION, status: await handleStart(message.payload) };
       case MessageType.STOP:
@@ -890,7 +1206,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       case MessageType.CAST_CONNECT:
         return { ok: true, version: PROTOCOL_VERSION, status: await handleCastConnect() };
       case MessageType.PERMISSION_GRANTED:
-        return { ok: true, version: PROTOCOL_VERSION, status: await handlePermissionGranted() };
+        return { ok: true, version: PROTOCOL_VERSION, status: await handlePermissionGrantedRequest(message.payload) };
       case MessageType.CAST_RELAY_ITEM:
         await serializeSessionTransition(() => handleCastRelayItem(message, sender));
         return { ok: true, version: PROTOCOL_VERSION };
@@ -920,9 +1236,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   return true;
 });
 
-// One episode preparation at a time. A controller navigation can emit multiple
-// completion events before the first asynchronous provider tab is registered.
-let navigationOperation = null;
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status !== "complete" || navigationOperation) return;
   const operation = (async () => {
@@ -944,8 +1257,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     if (session.tabId === tabId) {
       const playbackTabId = session.playbackTabId;
       const retiringPlaybackTabId = session.retiringPlaybackTabId;
-      session = stop(session);
-      await saveSession(session);
+      const update = await updateCurrentSession(session, (current) =>
+        current.tabId === tabId ? stop(current) : null);
+      if (update.stale) return;
+      session = update.session;
       if (Number.isInteger(playbackTabId)) await closePlaybackSurface(playbackTabId);
       if (Number.isInteger(retiringPlaybackTabId) && retiringPlaybackTabId !== playbackTabId) {
         await closePlaybackSurface(retiringPlaybackTabId);
@@ -955,21 +1270,33 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     }
 
     if (session.playbackTabId === tabId) {
-      const hasRetiringSender = Number.isInteger(session.retiringPlaybackTabId);
-      session = markPlaybackSurfaceLost(session);
-      await saveSession(session);
-      if (!hasRetiringSender) {
+      const update = await updateCurrentSession(session, (current) =>
+        current.playbackTabId === tabId ? markPlaybackSurfaceLost(current) : null);
+      if (update.stale) return;
+      session = update.session;
+      if (!Number.isInteger(session.retiringPlaybackTabId)) {
         await restorePlaybackMode(session.windowId, session.originalWindowState, session.changedWindowMode);
       }
       return;
     }
 
     if (session.retiringPlaybackTabId === tabId) {
-      const hadRelay = Boolean(session.cast?.relayToken);
-      session = clearCastRelay(session, hadRelay ? "FAILED" : session.cast?.relayState ?? null);
-      session = clearRetiringPlaybackSurface(session);
-      await saveSession(session);
-      if (hadRelay) await notifyCastRelayFailure(session, "CAST_RELAY_SENDER_CLOSED");
+      // A relay that was in flight or already delivered can no longer complete
+      // once its sender closes. Clear the retained identity here as well, so a
+      // later stickyResumeFailed (which may arrive after this branch cleared the
+      // retiring tab) cannot leave the dead latch behind.
+      let relayPending = false;
+      const update = await updateCurrentSession(session, (current) => {
+        if (current.retiringPlaybackTabId !== tabId) return null;
+        relayPending = Boolean(current.cast?.relayToken) ||
+          current.cast?.relayState === "TRANSFERRING";
+        let next = clearCastRelay(current, relayPending ? "FAILED" : current.cast?.relayState ?? null);
+        if (relayPending) next = clearRetainedCast(next);
+        return clearRetiringPlaybackSurface(next);
+      });
+      if (update.stale) return;
+      session = update.session;
+      if (relayPending) await notifyCastRelayFailure(session, "CAST_RELAY_SENDER_CLOSED");
     }
   }).catch(() => {});
 });

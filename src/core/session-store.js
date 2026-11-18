@@ -13,5 +13,3 @@ export async function saveSession(session) {
   }
   return session;
 }
-
-export const SESSION_STORAGE_KEY = KEY;

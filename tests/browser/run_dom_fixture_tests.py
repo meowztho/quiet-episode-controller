@@ -1,10 +1,14 @@
 from pathlib import Path
-import shutil
+import sys
 
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[2]
-CHROMIUM = shutil.which("chromium") or shutil.which("chromium-browser")
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from browser_path import describe_failure, find_browser
+
+CHROMIUM = find_browser()
 
 SITES = [
     {
@@ -92,7 +96,10 @@ def fail(message: str) -> None:
 def main() -> int:
     if not CHROMIUM:
         print("DOM FIXTURE TESTS: INCONCLUSIVE - Chromium not found")
+        print(describe_failure())
         return 2
+
+    print(f"DOM FIXTURE TESTS: browser {CHROMIUM}")
 
     adapter = (ROOT / "src/sites/episode-site-adapter.js").read_text(encoding="utf-8")
 

@@ -16,6 +16,11 @@
   const JW_PLAY_START_TIMEOUT_MS = 12000;
   const JW_TRUSTED_ESCALATION_MS = 1200;
   const STICKY_CAST_RESUME_TIMEOUT_MS = 6000;
+  // D-028 relay bounds. A hidden helper clamps timers to roughly one tick per
+  // minute, so the export window must cover at least one clamped discovery
+  // interval, and a delivered item needs its own promotion window.
+  const CAST_RELAY_EXPORT_TIMEOUT_MS = 60000;
+  const CAST_RELAY_PROMOTION_TIMEOUT_MS = 30000;
   const CAST_REMOTE_COMMAND_TIMEOUT_MS = 1500;
 
   let config = null;
@@ -50,6 +55,8 @@
   let stickyCastResumeTimerId = null;
   let stickyCastInteractiveRejoinReason = null;
   let castRelayItemRequested = false;
+  let castRelayDeadlineTimerId = null;
+  let castRelayDeadlinePhase = null;
   let activeCastRelayTransferId = null;
   let castRemoteCommandSequence = 0;
   const pendingCastRemoteCommands = new Map();
@@ -191,6 +198,40 @@
     stickyCastResumeTimerId = null;
   }
 
+  function clearCastRelayDeadline() {
+    if (castRelayDeadlineTimerId) clearTimeout(castRelayDeadlineTimerId);
+    castRelayDeadlineTimerId = null;
+    castRelayDeadlinePhase = null;
+  }
+
+  function castRelayDelivered() {
+    return stickyCastResumeState === "relay_transfer" || activeCastRelayTransferId !== null;
+  }
+
+  // Relay mode has its own bounds. "export" covers a helper whose JW player (or
+  // its opaque playlist item) never arrives; "promotion" covers an item that
+  // reached the retained sender but never produced remote playback.
+  function armCastRelayDeadline(phase) {
+    clearCastRelayDeadline();
+    if (!config?.castRelayMode || !stickyCastRequested()) return;
+    if (stickyCastResumeState === "remote" || stickyCastResumeState === "failed") return;
+    castRelayDeadlinePhase = phase;
+    castRelayDeadlineTimerId = setTimeout(() => {
+      castRelayDeadlineTimerId = null;
+      const expiredPhase = castRelayDeadlinePhase;
+      castRelayDeadlinePhase = null;
+      if (expiredPhase === "promotion") {
+        // The retained sender already owns the item, but no remote playback
+        // followed. Terminate the handoff instead of waiting forever.
+        fallBackFromStickyCast("CAST_RELAY_TIMEOUT", { force: true });
+      } else {
+        // The item never reached the sender, so abandoning the relay cannot
+        // destroy a pending Cast handoff.
+        fallBackFromStickyCast("CAST_RELAY_EXPORT_TIMEOUT");
+      }
+    }, phase === "promotion" ? CAST_RELAY_PROMOTION_TIMEOUT_MS : CAST_RELAY_EXPORT_TIMEOUT_MS);
+  }
+
   function stickyCastRequested() {
     return Boolean(config?.castSessionId);
   }
@@ -203,6 +244,10 @@
     if (!config?.castRelayMode || !stickyCastRequested()) return false;
     if (castRelayItemRequested || stickyCastResumeState === "remote" || stickyCastResumeState === "failed") return false;
     if (currentPlayerKind !== "jw" || !currentJwContainer) return false;
+    // The JW bridge answers EXPORT_CAST_ITEM with UNAVAILABLE while it has no
+    // player bound yet (a hidden helper clamps its discovery timer). The latch
+    // is released on that answer, so READY/AVAILABLE/STATUS can re-offer until
+    // the relay export deadline terminates the attempt.
     castRelayItemRequested = true;
     stickyCastResumeState = "relay_exporting";
     sendJwCommand("EXPORT_CAST_ITEM");
@@ -220,6 +265,8 @@
     // existing sticky-cast timeout releases local playback as the fallback.
     config.castRelayMode = false;
     stickyCastResumeState = "pending";
+    clearCastRelayDeadline();
+    armStickyCastResumeTimeout();
     emit("CAST_STATUS", {
       playerKind: "GoogleCast",
       traceEvent: "HTML5_CAST_REJOIN"
@@ -267,9 +314,15 @@
     return true;
   }
 
-  function fallBackFromStickyCast(reason) {
+  function fallBackFromStickyCast(reason, { force = false } = {}) {
     if (!stickyCastRequested() || stickyCastResumeState === "remote" || stickyCastResumeState === "failed") return;
+    // A delivered D-028 relay is owned by the retained sender. Closing that
+    // sender while remote promotion is pending would destroy the only page
+    // that holds the Cast session, so only the dedicated relay deadline may
+    // end it.
+    if (!force && config?.castRelayMode && castRelayDelivered()) return;
     clearStickyCastResumeTimer();
+    clearCastRelayDeadline();
     stickyCastResumeState = "failed";
     emit("CAST_STATUS", {
       playerKind: "GoogleCast",
@@ -284,6 +337,9 @@
   function armStickyCastResumeTimeout() {
     clearStickyCastResumeTimer();
     if (!stickyCastRequested()) return;
+    // Relay mode has its own export/promotion bounds; the local 6 s fallback
+    // would close the retained sender while the relay is still in flight.
+    if (config?.castRelayMode) return;
     stickyCastResumeTimerId = setTimeout(() => {
       stickyCastResumeTimerId = null;
       fallBackFromStickyCast("CAST_RESUME_TIMEOUT");
@@ -302,6 +358,27 @@
       handoffMethod: "TRUSTED_JW_CAST_CONTROL"
     });
     return true;
+  }
+
+  // Canonical retained-Cast continuation selector. The mechanisms below are
+  // provider/player adapters, not competing state-machine owners. In
+  // particular, a same-provider JW helper in D-028 relay mode must never also
+  // trigger the legacy/native JW Cast-control path; the retiring sender is the
+  // only sender allowed to transfer that episode.
+  function driveStickyCastContinuation(reason = null) {
+    if (!stickyCastRequested()) return false;
+
+    if (config?.castRelayMode) {
+      if (currentPlayerKind === "jw") return maybeOfferCastRelay();
+      if (currentPlayerKind === "html5") return switchHtml5StickyCastToRejoin();
+      return false;
+    }
+
+    if (currentPlayerKind === "jw") return maybeTransferStickyCast();
+    if (currentPlayerKind === "html5" && stickyCastConnected) {
+      return requestTrustedHtml5CastControl(reason || "HTML5_CAST_SESSION_REJOINED");
+    }
+    return false;
   }
 
   function clearJwStartup() {
@@ -383,8 +460,7 @@
     });
     sendJwCommand("PROBE");
     if (!shouldDeferLocalPlayback()) startJwPlaybackStartup();
-    else if (config?.castRelayMode) maybeOfferCastRelay();
-    else maybeTransferStickyCast();
+    else driveStickyCastContinuation();
   }
 
   function handleJwBridgeMessage(event) {
@@ -415,8 +491,7 @@
           emit("MEDIA_FOUND", status);
         }
         if (shouldDeferLocalPlayback()) {
-          if (config?.castRelayMode) maybeOfferCastRelay();
-          else maybeTransferStickyCast();
+          driveStickyCastContinuation();
         } else if (!jwPlayingObserved && !jwStartupTimerId) startJwPlaybackStartup();
         break;
       case "PLAY":
@@ -457,15 +532,34 @@
       }
       case "CAST_ITEM_EXPORT": {
         if (!config?.castRelayMode || !stickyCastRequested()) break;
+        // A re-offer can race the first export answer. The item is already on
+        // its way to the retained sender, so ignore a duplicate.
+        if (castRelayDelivered()) break;
         const item = data.payload?.item;
         if (!item || typeof item !== "object") {
           fallBackFromStickyCast("JW_CAST_RELAY_ITEM_INVALID");
           break;
         }
         stickyCastResumeState = "relay_transfer";
+        armCastRelayDeadline("promotion");
         emit("CAST_RELAY_ITEM", { item });
         break;
       }
+      case "UNAVAILABLE":
+        // The helper's JW bridge has no player bound yet. Do not keep the
+        // export latched on this silent answer: the next READY/AVAILABLE/
+        // STATUS may re-offer it until the relay export deadline.
+        if (config?.castRelayMode && stickyCastResumeState === "relay_exporting") {
+          const wasRequested = castRelayItemRequested;
+          castRelayItemRequested = false;
+          if (wasRequested) {
+            emit("CAST_STATUS", {
+              playerKind: "JWPlayer",
+              traceEvent: "CAST_RELAY_EXPORT_UNAVAILABLE"
+            });
+          }
+        }
+        break;
       case "CAST_ITEM_EXPORT_FAILED":
         if (config?.castRelayMode) fallBackFromStickyCast(data.payload?.reason || "JW_CAST_RELAY_ITEM_UNAVAILABLE");
         break;
@@ -589,6 +683,8 @@
       "CAST_STATE_CHANGED",
       "CAST_CONTEXT_CONFIGURED",
       "CAST_CONTEXT_CONFIG_FAILED",
+      "MEDIA_PUSH_BOUND",
+      "MEDIA_PUSH_UNAVAILABLE",
       "LOAD_MEDIA_CALLED",
       "LOAD_MEDIA_SUCCEEDED",
       "LOAD_MEDIA_FAILED"
@@ -598,15 +694,7 @@
         ["SESSION_RESUMED", "SESSION_STARTED"].includes(String(payload.sessionState || "").toUpperCase());
       if (stickyCastRequested() && (data.event === "STATUS" || rejoined) && payload.connected && payload.sessionId === config.castSessionId) {
         stickyCastConnected = true;
-        if (currentPlayerKind === "html5" && !config?.castRelayMode) {
-          // Rejoining the Cast session only restores sender/session ownership;
-          // unlike JW's requestCast relay it does not transfer the new HTML5
-          // episode. Trigger the provider-owned visible Cast control once so
-          // the provider remains responsible for its own media load.
-          requestTrustedHtml5CastControl("HTML5_CAST_SESSION_REJOINED");
-        } else if (!config?.castRelayMode) {
-          maybeTransferStickyCast();
-        }
+        driveStickyCastContinuation("HTML5_CAST_SESSION_REJOINED");
       }
       return;
     }
@@ -1211,7 +1299,7 @@
     detachVideo();
     currentPlayerKind = "html5";
     currentVideo = video;
-    switchHtml5StickyCastToRejoin();
+    driveStickyCastContinuation();
     currentVideo.setAttribute(CANONICAL_MEDIA_ATTR, "true");
     const presentation = enterPresentationMode(video);
     if (presentation.providerControls) removeControls();
@@ -1321,7 +1409,8 @@
     stickyCastResumeState = nextConfig.castRelayMode
       ? "relay_pending"
       : (nextConfig.castSessionId ? "pending" : "idle");
-    if (nextConfig.castSessionId) armStickyCastResumeTimeout();
+    if (nextConfig.castSessionId && nextConfig.castRelayMode) armCastRelayDeadline("export");
+    else if (nextConfig.castSessionId) armStickyCastResumeTimeout();
     observeDom();
     sendCastCommand("PROBE");
     if (nextConfig.castSessionId && !nextConfig.castRelayMode) {
@@ -1348,6 +1437,7 @@
     observer = null;
     clearDiscoveryTimeout();
     clearStickyCastResumeTimer();
+    clearCastRelayDeadline();
     stickyCastConnected = false;
     stickyCastTransferRequested = false;
     stickyCastInteractiveRejoinReason = null;
@@ -1487,7 +1577,9 @@
     }
 
     if (message.type === "CAST_RELAY_FAILED") {
-      if (config?.castRelayMode) fallBackFromStickyCast(message.payload?.reason || "CAST_RELAY_FAILED");
+      // The background already released the retained sender for this token, so
+      // the delivered-relay guard must not keep the helper waiting.
+      if (config?.castRelayMode) fallBackFromStickyCast(message.payload?.reason || "CAST_RELAY_FAILED", { force: true });
       sendResponse({ ok: true });
       return true;
     }
@@ -1507,34 +1599,9 @@
       castRelayItemRequested = false;
       activeCastRelayTransferId = null;
       clearStickyCastResumeTimer();
+      clearCastRelayDeadline();
       clearJwStartup();
       sendResponse({ ok: true });
-      return true;
-    }
-
-    if (message.type === "PROVIDER_PROBE") {
-      if (currentPlayerKind === "jw" || bestJwContainer()) {
-        sendJwCommand("PROBE");
-        sendResponse({
-          ok: true,
-          href: location.href,
-          playerFound: true,
-          playerKind: "JWPlayer",
-          state: normalizeJwStatus(lastJwStatus || {}),
-          lastPlayError: null
-        });
-        return true;
-      }
-      const video = currentVideo || bestVideo();
-      sendResponse({
-        ok: true,
-        href: location.href,
-        playerFound: Boolean(video),
-        playerKind: video ? "HTML5" : null,
-        videoFound: Boolean(video),
-        state: video ? { playerKind: "HTML5", ...snapshot(video) } : null,
-        lastPlayError
-      });
       return true;
     }
   });

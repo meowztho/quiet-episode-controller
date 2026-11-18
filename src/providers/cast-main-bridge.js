@@ -27,6 +27,9 @@
   let lastRemoteDuration = null;
   let boundCastContext = null;
   let castContextEventBindings = [];
+  let boundLegacyMedia = null;
+  let legacyMediaUpdateHandler = null;
+  let legacyMediaPushUnavailableReported = false;
   const instrumentedCastSessions = new WeakSet();
   const instrumentedLegacySessions = new WeakSet();
 
@@ -119,6 +122,9 @@
         post("LOAD_MEDIA_CALLED", loadTracePayload(this, request, api, "CALLED"));
         const onSuccess = (media) => {
           post("LOAD_MEDIA_SUCCEEDED", loadTracePayload(this, request, api, "SUCCEEDED"));
+          // A provider loadMedia replaces the active legacy media session. Bind
+          // the new object immediately instead of waiting for the next poll.
+          bindLegacyMediaUpdates(media);
           if (typeof successCallback === "function") return successCallback(media);
           return undefined;
         };
@@ -161,6 +167,64 @@
     }
   }
 
+  function legacyMediaPushAvailable(media) {
+    return Boolean(
+      media &&
+      typeof media.addUpdateListener === "function" &&
+      typeof media.removeUpdateListener === "function"
+    );
+  }
+
+  function unbindLegacyMediaUpdates() {
+    if (boundLegacyMedia && legacyMediaUpdateHandler) {
+      try { boundLegacyMedia.removeUpdateListener(legacyMediaUpdateHandler); } catch {}
+    }
+    boundLegacyMedia = null;
+    legacyMediaUpdateHandler = null;
+  }
+
+  // Live VOE/JW senders expose only the legacy chrome.cast.media.Media object,
+  // not the Framework RemotePlayer/RemotePlayerController pair. That object's
+  // documented addUpdateListener()/removeUpdateListener() pair is the
+  // push-based counterpart to the 1 s poll: a hidden page clamps timers to
+  // roughly one tick per minute, so the final near-end sample can otherwise be
+  // missed entirely and no REMOTE_ENDED is ever produced. Observation only; no
+  // media field is read, logged, or forwarded.
+  function bindLegacyMediaUpdates(media) {
+    if (remoteController) return;
+    const target = media === undefined
+      ? safeCall(safeCall(castObjects().context, "getCurrentSession", null), "getMediaSession", null)
+      : media;
+    if (target === boundLegacyMedia) return;
+    unbindLegacyMediaUpdates();
+    if (!target) return;
+    if (!legacyMediaPushAvailable(target)) {
+      if (!legacyMediaPushUnavailableReported) {
+        legacyMediaPushUnavailableReported = true;
+        post("MEDIA_PUSH_UNAVAILABLE", { traceEvent: "CAST_MEDIA_PUSH_UNAVAILABLE" });
+      }
+      return;
+    }
+    const handler = () => inspect();
+    try {
+      // Register before addUpdateListener() so a synchronous callback cannot
+      // re-enter this function and bind a second listener.
+      boundLegacyMedia = target;
+      legacyMediaUpdateHandler = handler;
+      target.addUpdateListener(handler);
+      post("MEDIA_PUSH_BOUND", {
+        mediaSessionId: Number.isFinite(Number(target.mediaSessionId)) ? Number(target.mediaSessionId) : null,
+        traceEvent: "CAST_MEDIA_PUSH_BOUND"
+      });
+    } catch {
+      unbindLegacyMediaUpdates();
+      if (!legacyMediaPushUnavailableReported) {
+        legacyMediaPushUnavailableReported = true;
+        post("MEDIA_PUSH_UNAVAILABLE", { traceEvent: "CAST_MEDIA_PUSH_UNAVAILABLE" });
+      }
+    }
+  }
+
   function ensureRemoteEvents() {
     const { framework } = castObjects();
     if (remoteController || !framework?.RemotePlayer || !framework?.RemotePlayerController) return;
@@ -180,6 +244,9 @@
         remoteController.addEventListener(type, handler);
         remoteEventBindings.push([type, handler]);
       }
+      // The Framework pair is the primary observation path; drop the legacy
+      // media listener so one receiver update is not observed twice.
+      unbindLegacyMediaUpdates();
     } catch {
       remotePlayer = null;
       remoteController = null;
@@ -480,6 +547,7 @@
     ensureCastApiInstrumentation();
     ensureCastContextEvents();
     ensureRemoteEvents();
+    bindLegacyMediaUpdates();
     ensureCastContextConfigured();
     const status = snapshot();
     maybeRejoin(status);
@@ -614,9 +682,14 @@
     }
   };
 
+  // Compatibility fallback only. Hidden pages clamp this timer to roughly one
+  // tick per minute, so episode-end observation must not depend on it: the
+  // Framework RemotePlayer events or the legacy media update listener above
+  // are the primary push-based drivers.
   const timer = setInterval(inspect, POLL_MS);
   window.addEventListener("pagehide", () => {
     clearInterval(timer);
+    unbindLegacyMediaUpdates();
     if (remoteController) {
       for (const [type, handler] of remoteEventBindings) {
         try { remoteController.removeEventListener(type, handler); } catch {}

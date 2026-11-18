@@ -1,10 +1,14 @@
 from pathlib import Path
-import shutil
+import sys
 
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[2]
-CHROMIUM = shutil.which("chromium") or shutil.which("chromium-browser")
+sys.path.insert(0, str(ROOT / "scripts"))
+
+from browser_path import describe_failure, find_browser
+
+CHROMIUM = find_browser()
 
 BOOTSTRAP = r"""
 window.__qecMessages = [];
@@ -21,7 +25,10 @@ window.chrome = {
 def main() -> int:
     if not CHROMIUM:
         print("PROVIDER FIXTURE TESTS: INCONCLUSIVE - Chromium not found")
+        print(describe_failure())
         return 2
+
+    print(f"PROVIDER FIXTURE TESTS: browser {CHROMIUM}")
 
     agent = (ROOT / "src/providers/frame-agent.js").read_text(encoding="utf-8")
     jw_bridge = (ROOT / "src/providers/jw-main-bridge.js").read_text(encoding="utf-8")
@@ -892,6 +899,8 @@ window.__legacyMedia = {
   idleReason: null,
   media: { duration: 120 },
   getEstimatedTime() { return this.currentTime; },
+  addUpdateListener(fn) { (window.__legacyMediaUpdates ||= []).push(fn); },
+  removeUpdateListener(fn) { window.__legacyMediaUpdates = (window.__legacyMediaUpdates || []).filter(item => item !== fn); },
   play(request, success) {
     window.__legacyRemoteCalls.push('play');
     this.playerState = 'PLAYING';
@@ -952,6 +961,22 @@ window.chrome = { cast: {
             legacy_remote_page.wait_for_function("window.__legacyRemoteMessages.some(m => m.event === 'REMOTE_CONTROL_RESULT' && m.payload.commandId === 'legacy-seek' && m.payload.ok === true)")
             assert legacy_remote_page.evaluate("JSON.stringify(window.__legacyRemoteCalls)") == '["pause",["seek",35]]'
             assert legacy_remote_page.evaluate("window.__legacyMedia.currentTime") == 35
+
+            # The legacy media object is the only observation surface on live
+            # VOE/JW senders. Its own update callback must drive the same
+            # near-end completion path as the Framework remote events.
+            legacy_remote_page.wait_for_function("window.__legacyRemoteMessages.some(m => m.event === 'MEDIA_PUSH_BOUND' && m.payload.traceEvent === 'CAST_MEDIA_PUSH_BOUND')")
+            legacy_remote_page.evaluate("""
+              window.__legacyMedia.playerState = 'PLAYING';
+              window.__legacyMedia.currentTime = 119.4;
+              [...(window.__legacyMediaUpdates || [])].forEach(fn => fn(true));
+            """)
+            legacy_remote_page.evaluate("""
+              window.__legacyRemoteSession.getMediaSession = () => null;
+              window.__legacyMedia.playerState = 'IDLE';
+              [...(window.__legacyMediaUpdates || [])].forEach(fn => fn(false));
+            """)
+            legacy_remote_page.wait_for_function("window.__legacyRemoteMessages.some(m => m.event === 'REMOTE_ENDED' && m.payload.endDetection === 'MEDIA_UNLOADED_NEAR_END')")
 
             # Some current Cast sender surfaces expose the Framework API but do
             # not expose legacy chrome.cast.requestSessionById(). In that case
@@ -1200,7 +1225,7 @@ window.jwplayer = function () { return window.__relaySenderPlayer; };
             assert relay_sender.evaluate("window.__qecMessages.some(m => m.type !== 'CAST_RELAY_ITEM' && JSON.stringify(m).includes('media.example.invalid'))") is False
 
             print("PROVIDER FIXTURE TESTS: PASS")
-            print(" exercised: MEDIA_FOUND MEDIA_PLAYING MEDIA_ENDED MEDIA_REPLACED START_RETRY AUTOPLAY_BLOCKED USER_START_CONTROLS PRE_VIDEO_ACTIVATION JW_NATIVE_DRIVER JW_VIEWPORT_RESIZE JW_SPACE_TOGGLE TARGETED_BACKGROUND_SPACE_ACTIVATION HTML5_PROVIDER_UI HTML5_STICKY_CAST_REJOIN CAST_FRAMEWORK_REQUEST_SESSION_FALLBACK HTML5_BACKGROUND_USER_GESTURE CAST_SESSION_REJOIN CAST_TRUSTED_NATIVE_CONTROL CAST_JW_CAST_EVENT CAST_CONTEXT_BOOTSTRAP CAST_DUAL_LOAD_MEDIA_TRACE CAST_REMOTE_EVENT_END CAST_REMOTE_LEGACY_MEDIA_FALLBACK CAST_SENDER_OVERLAP CAST_OPAQUE_JW_RELAY CHROME_EARLY_TRUSTED_ESCALATION")
+            print(" exercised: MEDIA_FOUND MEDIA_PLAYING MEDIA_ENDED MEDIA_REPLACED START_RETRY AUTOPLAY_BLOCKED USER_START_CONTROLS PRE_VIDEO_ACTIVATION JW_NATIVE_DRIVER JW_VIEWPORT_RESIZE JW_SPACE_TOGGLE TARGETED_BACKGROUND_SPACE_ACTIVATION HTML5_PROVIDER_UI HTML5_STICKY_CAST_REJOIN CAST_FRAMEWORK_REQUEST_SESSION_FALLBACK HTML5_BACKGROUND_USER_GESTURE CAST_SESSION_REJOIN CAST_TRUSTED_NATIVE_CONTROL CAST_JW_CAST_EVENT CAST_CONTEXT_BOOTSTRAP CAST_DUAL_LOAD_MEDIA_TRACE CAST_REMOTE_EVENT_END CAST_REMOTE_LEGACY_MEDIA_FALLBACK CAST_LEGACY_MEDIA_PUSH CAST_SENDER_OVERLAP CAST_OPAQUE_JW_RELAY CHROME_EARLY_TRUSTED_ESCALATION")
             return 0
         finally:
             browser.close()

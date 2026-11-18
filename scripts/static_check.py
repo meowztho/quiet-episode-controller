@@ -7,6 +7,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 errors = []
 
+
+def shipped_sources():
+    """Every src/ module. All of src/ is shipped; there are no exclusions."""
+    yield from sorted(SRC.rglob("*.js"))
+
 manifest = json.loads((ROOT / "manifest.json").read_text(encoding="utf-8"))
 if manifest.get("manifest_version") != 3:
     errors.append("manifest must use MV3")
@@ -33,7 +38,7 @@ for host in required_provider_hosts:
     if host not in manifest.get("host_permissions", []):
         errors.append(f"known provider host permission missing for first-run hands-free startup: {host}")
 
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     text = path.read_text(encoding="utf-8")
     rel = path.relative_to(ROOT)
     forbidden = [
@@ -59,10 +64,10 @@ for path in SRC.rglob("*.js"):
 # None may move the OS pointer, force foreground focus, inspect provider network traffic,
 # select a receiver, construct/load Cast media, or click arbitrary page coordinates.
 debugger_owners = []
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     text = path.read_text(encoding="utf-8")
     if "chrome.debugger" in text:
-        debugger_owners.append(str(path.relative_to(ROOT)))
+        debugger_owners.append(path.relative_to(ROOT).as_posix())
     if re.search(r"[\"']Input\.", text) and path.name != "gesture-activation.js":
         errors.append(f"{path.relative_to(ROOT)}: DevTools Input domain bypasses the bounded playback activation transport")
 if debugger_owners != ["src/providers/gesture-activation.js"]:
@@ -88,10 +93,10 @@ for forbidden_command in ["Network.", "DOM.", "Page.", "Input.insertText", "Fetc
         errors.append(f"gesture activation must not use DevTools {forbidden_command}")
 
 permission_request_owners = []
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     text = path.read_text(encoding="utf-8")
     if "chrome.permissions.request" in text:
-        permission_request_owners.append(str(path.relative_to(ROOT)))
+        permission_request_owners.append(path.relative_to(ROOT).as_posix())
 if permission_request_owners != ["src/ui/popup.js"]:
     errors.append(
         "chrome.permissions.request must exist only in src/ui/popup.js; found "
@@ -102,17 +107,17 @@ if permission_request_owners != ["src/ui/popup.js"]:
 # synchronously activate exactly one already-resolved semantic player control from
 # the extension's explicit user-activation button; coordinate/arbitrary clicking is
 # still outside the architecture.
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     text = path.read_text(encoding="utf-8")
     clicks = re.findall(r"\b([A-Za-z_$][\w$]*)\.click\s*\(", text)
     if not clicks:
         continue
-    rel = str(path.relative_to(ROOT))
+    rel = path.relative_to(ROOT).as_posix()
     if rel != "src/providers/frame-agent.js" or clicks != ["trigger"]:
         errors.append(f"{rel}: only the Provider Frame Agent's semantic trigger.click() is authorized; found {clicks!r}")
 
 controller_host_literals = ["aniworld.to", "serienstream.to", "186.2.175.5"]
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     if "sites" in path.parts:
         continue
     text = path.read_text(encoding="utf-8").lower()
@@ -121,14 +126,14 @@ for path in SRC.rglob("*.js"):
             errors.append(f"{path.relative_to(ROOT)}: controller hostname {host} leaked outside site adapter boundary")
 
 # Top-level provider navigation/document resolution belongs to Playback Surface.
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     if path.name == "playback-surface.js":
         continue
     text = path.read_text(encoding="utf-8")
     if "chrome.webNavigation" in text or "chrome.webRequest" in text:
         errors.append(f"{path.relative_to(ROOT)}: provider navigation inspection bypasses Playback Surface")
 
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     if path.name == "frame-agent.js":
         continue
     text = path.read_text(encoding="utf-8")
@@ -137,7 +142,7 @@ for path in SRC.rglob("*.js"):
 
 
 # Page-level JW API access belongs only to the Provider Frame Agent's MAIN-world bridge.
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     if path.name == "jw-main-bridge.js":
         continue
     text = path.read_text(encoding="utf-8")
@@ -153,10 +158,10 @@ for path in SRC.rglob("*.js"):
 # must not be persisted, logged, inspected for media identifiers, or generalized
 # into a stream-extraction interface.
 cast_api_owners = []
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     text = path.read_text(encoding="utf-8")
     if "cast?.framework" in text or "chrome?.cast" in text or "cast.framework" in text or "chrome.cast" in text:
-        cast_api_owners.append(str(path.relative_to(ROOT)))
+        cast_api_owners.append(path.relative_to(ROOT).as_posix())
 if cast_api_owners != ["src/providers/cast-main-bridge.js"]:
     errors.append("Google Cast page API access must exist only in src/providers/cast-main-bridge.js; found " + repr(cast_api_owners))
 cast_bridge_text = (SRC / "providers" / "cast-main-bridge.js").read_text(encoding="utf-8")
@@ -183,7 +188,7 @@ if "SessionState.STOPPED" in popup_text or "SessionState.COMPLETED" in popup_tex
     errors.append("popup must not infer global session ownership from terminal episode-state labels")
 if "isSessionActive(existing)" not in background_text:
     errors.append("background Start admission must use Session Core's global active-session contract")
-if "markPlaybackSurfaceLost(session)" not in background_text:
+if not re.search(r"markPlaybackSurfaceLost\(\w+\)", background_text):
     errors.append("unexpected canonical playback-tab loss must remain owned by Session Core rather than calling stop()")
 for owner_name, owner_text in [("background", background_text), ("session core", session_text)]:
     for forbidden_cast in ["loadMedia(", ".contentId", "media.contentId", "MediaInfo(", "LoadRequest("]:
@@ -194,13 +199,25 @@ if "CAST_RELAY_ITEM" not in background_text or "CAST_RELAY_APPLY" not in backgro
 if "requestCast([item])" not in jw_bridge_text:
     errors.append("D-028 retained JW sender must receive the opaque item only through requestCast([item])")
 
+# Retained-Cast continuation mechanisms are adapters beneath one selector. A JW
+# helper in D-028 relay mode must not independently trigger the older native
+# Cast-control path when Cast STATUS events arrive during the relay.
+frame_agent_text = (SRC / "providers" / "frame-agent.js").read_text(encoding="utf-8")
+if "function driveStickyCastContinuation" not in frame_agent_text:
+    errors.append("Provider Agent must own retained-Cast strategy selection through driveStickyCastContinuation")
+for mechanism in ["maybeOfferCastRelay", "switchHtml5StickyCastToRejoin", "maybeTransferStickyCast"]:
+    if frame_agent_text.count(f"{mechanism}(") != 2:
+        errors.append(f"{mechanism} must be called only by the canonical retained-Cast continuation selector")
+if "isRetainedCastRelayInFlight(session)" not in background_text:
+    errors.append("Background must reject helper-side Cast success while the retained JW relay is in flight")
+
 # Playback tab creation/removal belongs to Playback Surface; orchestration commands it through the contract.
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     text = path.read_text(encoding="utf-8")
     if path.name != "playback-surface.js" and ("chrome.tabs.create" in text or "chrome.tabs.remove" in text):
         errors.append(f"{path.relative_to(ROOT)}: playback tab lifecycle bypasses Playback Surface")
 
-for path in SRC.rglob("*.js"):
+for path in shipped_sources():
     if path.name == "window-controller.js":
         continue
     text = path.read_text(encoding="utf-8")

@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Quiet Episode Controller",
-  "version": "0.5.19",
+  "version": "0.6.1",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuuWCHTnH2QyDXQ3Ohc/uP/d7+/+aK7/L1AqZmKGo+7jvFxZsmbs4UtoG7n/1iGr7DcEerZlTdO9QP51lRAX3J8MmFJJXHW0Mz7Rg05llZYUH3fQRQ8oGbQQu33tCfhC/QEW9CJO+rTAT0PEuXB+DtZsixFl2qej3Z7oY2bq+O/4TYMv6bmKdyk4mkWXPTI2xYLlHILX/zWdGWJRRKDt+K1/HCSFmnFLMI03vPV2bB7UGwvREUVzEffU2AVvkmN47eXpH6gVgbwjpfIyKi5PKhyLWEFppdSH6mYafAxZTNw4sz8E9Qd5CrHExYUaAP4aJL3PXia+AIy4OHWcdCgai+QIDAQAB",
   "description": "Hands-off episode progression without OS mouse or keyboard automation.",
   "permissions": [
     "activeTab",
